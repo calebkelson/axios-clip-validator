@@ -80,6 +80,28 @@ docker compose -f docker-compose.mac-worker.yml logs -f worker
 
 The worker image supplies FFmpeg, ffprobe, yt-dlp, the Axios logo, the licensed font, and a writable temporary directory. It downloads one R2 source to scratch storage for probing/transcription/rendering, then uploads the generated assets back to R2. It does not expose a port.
 
+### 3.1 Daily YouTube insights service
+
+The same stack has a separate `insights` service so analytics refreshes do not
+compete with media rendering. Before starting it, set `CLIPPER_API_URL` to the
+Render API URL and set `YOUTUBE_CHANNEL_ID` in `.env.mac-worker`:
+
+```sh
+mkdir -p data/youtube-retention
+docker compose -f docker-compose.mac-worker.yml up --build -d insights
+docker compose -f docker-compose.mac-worker.yml logs -f insights
+```
+
+The service runs the incremental YouTube sync/ingest automation on startup and
+every 24 hours. If a refreshed retention export is copied to
+`data/youtube-retention/youtube_retention_all_133_videos.csv`, it imports it
+and skips unchanged files by hash. Set `YOUTUBE_RETENTION_FORCE=true` only
+when you intentionally want a second snapshot from an unchanged file.
+
+This is a scheduler for data already available to the system. YouTube Studio
+retention exports are not fetched automatically yet; an Analytics API/OAuth
+adapter is still required if the export step itself must be unattended.
+
 To stop processing without losing queued work:
 
 ```sh

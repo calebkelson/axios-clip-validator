@@ -35,6 +35,20 @@ docker compose -f docker-compose.mac-worker.yml up --build -d
 docker compose -f docker-compose.mac-worker.yml logs -f worker
 ```
 
+The same Compose stack includes a separate `insights` service. It runs the
+YouTube metadata/ingestion automation every 24 hours and imports a changed
+retention CSV when one is mounted at `./data/youtube-retention`. Start or
+inspect it independently:
+
+```sh
+docker compose -f docker-compose.mac-worker.yml up -d insights
+docker compose -f docker-compose.mac-worker.yml logs -f insights
+```
+
+The scheduler does not manufacture retention data: a refreshed YouTube
+Analytics export or a future Analytics API adapter must place the CSV in that
+directory.
+
 Do not use Render's local/internal database URL on the Mac mini; use the external URL and keep `sslmode=require`. On Render, set `ASSET_STORE=r2` and the same R2 variables on the API. The Render API and Mac mini worker should use the same R2 bucket and the same database. Keep R2 access keys server-side; they must never be placed in the frontend site.
 
 Each candidate includes timestamped transcript evidence, score, confidence, rationale, and a social-copy object: `{ "headline": "...", "caption": "...", "hashtags": ["#Axios"], "headlineCards": [{ "id": "headline-1", "text": "...", "startSeconds": 0, "endSeconds": 3, "color": "navy" }] }`. Social copy is generated from that candidate's own transcript window, so overlapping clips do not inherit one video-wide caption or hashtag set. Headline cards are clip-relative, timed overlays that are sent to FFmpeg; the post caption and hashtags remain publishing metadata.

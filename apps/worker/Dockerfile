@@ -9,6 +9,7 @@ RUN pnpm install --frozen-lockfile=false
 COPY apps/worker apps/worker
 COPY packages/processing packages/processing
 COPY packages/storage packages/storage
+COPY scripts scripts
 COPY assets assets
 RUN pnpm build && mkdir -p /tmp/clipper /data && chmod 777 /tmp/clipper /data
 ENV TMPDIR=/tmp/clipper

@@ -24,3 +24,20 @@ services:
       FFMPEG_PRESET: veryfast
       FFMPEG_CRF: 20
     restart: unless-stopped
+
+  insights:
+    build:
+      context: .
+      dockerfile: apps/worker/Dockerfile
+    env_file:
+      - ${MAC_WORKER_ENV_FILE:-.env.mac-worker}
+    environment:
+      ASSET_STORE: r2
+      INSIGHTS_INTERVAL_HOURS: 24
+      INSIGHTS_RUN_ON_START: "true"
+      YOUTUBE_RETENTION_IMPORT_ENABLED: "true"
+      YOUTUBE_RETENTION_CSV: /data/youtube-retention/youtube_retention_all_133_videos.csv
+    volumes:
+      - ${YOUTUBE_RETENTION_DIR:-./data/youtube-retention}:/data/youtube-retention:ro
+    command: ["pnpm", "exec", "tsx", "scripts/daily-youtube-insights.ts"]
+    restart: unless-stopped
