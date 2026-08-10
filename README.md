@@ -8,7 +8,7 @@ Use Node 22 and pnpm. Copy `.env.example` to `.env`, run `pnpm install`, then `d
 
 Or run the complete local stack: `docker compose up --build`. Apply migrations from the host after PostgreSQL is healthy: `DATABASE_URL=postgres://clipper:clipper@localhost:5433/clipper pnpm db:migrate`.
 
-Environment: `DATABASE_URL`, `PORT` (3000), `ASSET_DATA_DIR` (shared local assets), `MAX_UPLOAD_BYTES` (defaults to 5 GB), `MAX_SOURCE_BYTES` (defaults to 5 GB), `WORKER_CONCURRENCY` (currently 1), `LEASE_SECONDS` (defaults to 60), `RENDER_LEASE_SECONDS` (defaults to `LEASE_SECONDS`), `FFMPEG_BIN`, `FFMPEG_PRESET` (`veryfast`), `FFMPEG_CRF` (`20`), `BRAND_LOGO_PATH`, optional `BRAND_FONT_PATH`, optional `BRAND_FONT_NAME`, `FFPROBE_BIN` (defaults to `ffprobe`), `TRANSCRIPTION_PROVIDER` (`sidecar` by default or `whisper`), `WHISPER_BIN`, `WHISPER_MODEL`, `WHISPER_LANGUAGE`, `CANDIDATE_MIN_SECONDS` (8), `CANDIDATE_MAX_SECONDS` (90), `MAX_CANDIDATES` (8), `YOUTUBE_DATA_API_KEY`, `YOUTUBE_CHANNEL_ID`, and `YOUTUBE_SYNC_MAX_PAGES` (100).
+Environment: `DATABASE_URL`, `PORT` (3000), `ASSET_STORE` (`local` by default or `r2`), `ASSET_DATA_DIR` (local assets), `ASSET_CACHE_DIR` (remote asset scratch/cache directory), `R2_ENDPOINT`, `R2_BUCKET`, `R2_REGION` (`auto`), `R2_ACCESS_KEY_ID`, and `R2_SECRET_ACCESS_KEY`, `MAX_UPLOAD_BYTES` (defaults to 5 GB), `MAX_SOURCE_BYTES` (defaults to 5 GB), `WORKER_CONCURRENCY` (currently 1), `LEASE_SECONDS` (defaults to 60), `RENDER_LEASE_SECONDS` (defaults to `LEASE_SECONDS`), `FFMPEG_BIN`, `FFMPEG_PRESET` (`veryfast`), `FFMPEG_CRF` (`20`), `BRAND_LOGO_PATH`, optional `BRAND_FONT_PATH`, optional `BRAND_FONT_NAME`, `FFPROBE_BIN` (defaults to `ffprobe`), `TRANSCRIPTION_PROVIDER` (`sidecar` by default or `whisper`), `WHISPER_BIN`, `WHISPER_MODEL`, `WHISPER_LANGUAGE`, `CANDIDATE_MIN_SECONDS` (8), `CANDIDATE_MAX_SECONDS` (90), `MAX_CANDIDATES` (8), `YOUTUBE_DATA_API_KEY`, `YOUTUBE_CHANNEL_ID`, and `YOUTUBE_SYNC_MAX_PAGES` (100).
 
 ## API examples
 
@@ -22,7 +22,20 @@ Queue an FFmpeg render with `POST /v1/candidates/:candidateId/renders` and body 
 
 ## Worker behavior
 
-PostgreSQL is the queue and source of truth. The worker uses `FOR UPDATE SKIP LOCKED`, leases a job, increments attempts, requeues expired leases, streams direct sources into canonical assets, runs `ffprobe`, persists probe metadata, generates transcript-grounded candidates, and renders queued clips. Worker containers include `ffmpeg`, `ffprobe`, the approved Axios logo, the supplied NB International Pro Bold font, a DejaVu fallback, a writable temp directory, and the mounted `./data` directory. Storage is behind `AssetStore`; the local implementation returns `local://` references and has no paths embedded in domain models. An S3/R2 store can later implement that interface.
+PostgreSQL is the queue and source of truth. The worker uses `FOR UPDATE SKIP LOCKED`, leases a job, increments attempts, requeues expired leases, streams direct sources into canonical assets, runs `ffprobe`, persists probe metadata, generates transcript-grounded candidates, and renders queued clips. Worker containers include `ffmpeg`, `ffprobe`, the approved Axios logo, the supplied NB International Pro Bold font, a DejaVu fallback, and a writable temp directory. Storage is behind `AssetStore`: local mode uses `ASSET_DATA_DIR`, while R2 mode keeps shared media in `axios-clip-assets` and materializes one source at a time into the worker's temporary directory for FFmpeg/ffprobe. The API continues to serve browser-compatible range requests through `/v1/assets/:assetId`.
+
+## Render API + Mac mini worker
+
+The intended hosted layout is Render PostgreSQL plus a Render Docker Web Service for the API, with the Mac mini running the only processing worker. Both services use the same Render `DATABASE_URL` and R2 credentials; the Mac mini does not need an inbound public port. If the Mac mini is offline, jobs remain queued in PostgreSQL until it returns.
+
+For the Mac mini, install Docker Desktop, copy `mac-worker.env.example` to `.env.mac-worker`, fill in the Render external database URL and R2 access keys, then run:
+
+```sh
+docker compose -f docker-compose.mac-worker.yml up --build -d
+docker compose -f docker-compose.mac-worker.yml logs -f worker
+```
+
+Do not use Render's local/internal database URL on the Mac mini; use the external URL and keep `sslmode=require`. On Render, set `ASSET_STORE=r2` and the same R2 variables on the API. The Render API and Mac mini worker should use the same R2 bucket and the same database. Keep R2 access keys server-side; they must never be placed in the frontend site.
 
 Each candidate includes timestamped transcript evidence, score, confidence, rationale, and a social-copy object: `{ "headline": "...", "caption": "...", "hashtags": ["#Axios"], "headlineCards": [{ "id": "headline-1", "text": "...", "startSeconds": 0, "endSeconds": 3, "color": "navy" }] }`. Social copy is generated from that candidate's own transcript window, so overlapping clips do not inherit one video-wide caption or hashtag set. Headline cards are clip-relative, timed overlays that are sent to FFmpeg; the post caption and hashtags remain publishing metadata.
 

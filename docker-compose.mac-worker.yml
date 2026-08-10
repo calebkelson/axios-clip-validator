@@ -1,0 +1,26 @@
+services:
+  worker:
+    build:
+      context: .
+      dockerfile: apps/worker/Dockerfile
+    env_file:
+      - ${MAC_WORKER_ENV_FILE:-.env.mac-worker}
+    environment:
+      ASSET_STORE: r2
+      ASSET_CACHE_DIR: /tmp/clipper-assets
+      TMPDIR: /tmp/clipper
+      WORKER_CONCURRENCY: 1
+      LEASE_SECONDS: 60
+      RENDER_LEASE_SECONDS: 120
+      MAX_SOURCE_BYTES: 5000000000
+      TRANSCRIPTION_PROVIDER: sidecar
+      SOURCE_PLATFORM_ADAPTER: yt-dlp
+      YTDLP_BIN: /opt/yt-dlp/bin/yt-dlp
+      BRAND_LOGO_PATH: /app/assets/brand/axios-logo.png
+      BRAND_FONT_PATH: /app/assets/brand/NBInternationalPro-Bold.ttf
+      BRAND_FONT_NAME: NB International Pro Bold
+      CANDIDATE_MIN_SECONDS: 30
+      CANDIDATE_MAX_SECONDS: 60
+      FFMPEG_PRESET: veryfast
+      FFMPEG_CRF: 20
+    restart: unless-stopped
