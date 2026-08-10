@@ -2,10 +2,8 @@ import Fastify from 'fastify';
 import multipart from '@fastify/multipart';
 import pg from 'pg';
 import { randomUUID } from 'node:crypto';
-import { createReadStream } from 'node:fs';
-import { stat } from 'node:fs/promises';
 import { AudienceMomentSchema, AudienceSignalSchema, BrandAssetSchema, CandidateSchema, CreateJobSchema, CreateRenderSchema, CreateSourceSchema, JobSchema, ProbeSchema, RenderSchema, TranscriptSchema, UpdateCandidateSchema, YouTubeChannelSchema, YouTubeIngestRequestSchema, YouTubeSyncRequestSchema, YouTubeVideoSchema } from '@clipper/contracts';
-import { LocalAssetStore } from '@clipper/storage';
+import { AssetStore } from '@clipper/storage';
 import { ZodError } from 'zod';
 import { YouTubeCatalogSync, YouTubeDataApiClient, YouTubeSyncError } from './youtube-sync.js';
 import { YouTubeIngestionService } from './youtube-ingestion.js';
@@ -267,7 +265,7 @@ const toDashboardClip = (row: Record<string, any>) => {
   };
 };
 
-export function buildApp(db: pg.Pool, store: LocalAssetStore, maxUploadBytes = 5_000_000_000) {
+export function buildApp(db: pg.Pool, store: AssetStore, maxUploadBytes = 5_000_000_000) {
   const app = Fastify({ logger: true });
   const youtubeApiKey = process.env.YOUTUBE_DATA_API_KEY?.trim();
   const youtubeSync = youtubeApiKey ? new YouTubeCatalogSync(db, new YouTubeDataApiClient(youtubeApiKey), Number(process.env.YOUTUBE_SYNC_MAX_PAGES ?? 100)) : null;
@@ -643,8 +641,10 @@ export function buildApp(db: pg.Pool, store: LocalAssetStore, maxUploadBytes = 5
     if (!result.rowCount) return reply.code(404).send({ error: 'asset_not_found' });
     const asset = result.rows[0];
     try {
-      const path = store.getPath(asset.storage_key);
-      const fileSize = Number(asset.byte_size ?? (await stat(path)).size);
+      const knownSize = Number(asset.byte_size);
+      const hasKnownSize = Number.isSafeInteger(knownSize) && knownSize >= 0;
+      const full = hasKnownSize ? null : await store.getStream(asset.storage_key);
+      const fileSize = hasKnownSize ? knownSize : full!.totalLength;
       if (!Number.isSafeInteger(fileSize) || fileSize < 0) return reply.code(404).send({ error: 'asset_not_found' });
       reply.header('Content-Type', asset.content_type ?? 'application/octet-stream');
       reply.header('Content-Disposition', 'inline');
@@ -652,31 +652,32 @@ export function buildApp(db: pg.Pool, store: LocalAssetStore, maxUploadBytes = 5
       const rangeHeader = request.headers.range;
       if (!rangeHeader) {
         reply.header('Content-Length', String(fileSize));
-        return reply.send(createReadStream(path));
+        return reply.send(full ? full.stream : (await store.getStream(asset.storage_key)).stream);
       }
 
-      const match = /^bytes=(\d*)-(\d*)$/.exec(rangeHeader.trim());
-      if (!match) {
+      const range = parseByteRange(rangeHeader, fileSize);
+      if (!range) {
         reply.header('Content-Range', `bytes */${fileSize}`);
         return reply.code(416).send();
       }
-      const requestedStart = match[1] ? Number(match[1]) : null;
-      const requestedEnd = match[2] ? Number(match[2]) : null;
-      const start = requestedStart === null
-        ? Math.max(0, fileSize - (requestedEnd ?? 0))
-        : requestedStart;
-      const end = requestedEnd === null ? fileSize - 1 : Math.min(requestedEnd, fileSize - 1);
-      if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || start < 0 || start >= fileSize || end < start) {
-        reply.header('Content-Range', `bytes */${fileSize}`);
-        return reply.code(416).send();
-      }
+      const ranged = await store.getStream(asset.storage_key, range);
       reply.code(206);
-      reply.header('Content-Range', `bytes ${start}-${end}/${fileSize}`);
-      reply.header('Content-Length', String(end - start + 1));
-      return reply.send(createReadStream(path, { start, end }));
+      reply.header('Content-Range', `bytes ${range.start}-${range.end}/${fileSize}`);
+      reply.header('Content-Length', String(ranged.contentLength));
+      return reply.send(ranged.stream);
     } catch {
       return reply.code(404).send({ error: 'asset_not_found' });
     }
   });
   return app;
+}
+
+function parseByteRange(value: string, fileSize: number): { start: number; end: number } | null {
+  const match = /^bytes=(\d*)-(\d*)$/.exec(value.trim());
+  if (!match || fileSize <= 0) return null;
+  const requestedStart = match[1] ? Number(match[1]) : null;
+  const requestedEnd = match[2] ? Number(match[2]) : null;
+  const start = requestedStart === null ? Math.max(0, fileSize - (requestedEnd ?? 0)) : requestedStart;
+  const end = requestedEnd === null ? fileSize - 1 : Math.min(requestedEnd, fileSize - 1);
+  return Number.isSafeInteger(start) && Number.isSafeInteger(end) && start >= 0 && start < fileSize && end >= start ? { start, end } : null;
 }

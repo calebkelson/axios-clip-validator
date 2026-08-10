@@ -4,7 +4,7 @@ import { execFile as execFileCallback, spawn } from 'node:child_process';
 import { dirname, join, resolve } from 'node:path';
 import { promisify } from 'node:util';
 import pg from 'pg';
-import { LocalAssetStore } from '@clipper/storage';
+import { AssetStore } from '@clipper/storage';
 
 const execFile = promisify(execFileCallback);
 
@@ -62,7 +62,7 @@ export class RenderProcessor {
 
   constructor(
     private readonly db: pg.Pool,
-    private readonly store: LocalAssetStore,
+    private readonly store: AssetStore,
     private readonly leaseSeconds = 60,
     options: { ffmpegBinary?: string; brandLogoPath?: string; brandFontPath?: string; brandFontName?: string } = {},
   ) {
@@ -82,6 +82,7 @@ export class RenderProcessor {
     if (!claim.rowCount) return null;
     const renderId = claim.rows[0].id as string;
     let heartbeat: ReturnType<typeof setInterval> | undefined;
+    const workDir = join(process.env.TMPDIR ?? '/tmp', 'clipper-renders', renderId);
     try {
       heartbeat = setInterval(() => {
         void this.db.query("UPDATE clip_renders SET lease_expires_at=now() + ($2 * interval '1 second'), updated_at=now() WHERE id=$1 AND status='processing'", [renderId, this.leaseSeconds]).catch(() => undefined);
@@ -91,22 +92,22 @@ export class RenderProcessor {
       const startSeconds = Number(job.edited_start_seconds ?? job.start_seconds);
       const endSeconds = Number(job.edited_end_seconds ?? job.end_seconds);
       if (!Number.isFinite(startSeconds) || !Number.isFinite(endSeconds) || endSeconds <= startSeconds) throw new Error('Render window must have a positive duration');
-      this.store.getPath(job.source_storage_key);
-      const logoPath = job.include_logo ? await this.logoPathFor(job.logo_asset_id) : null;
+      await mkdir(workDir, { recursive: true });
+      const sourcePath = await this.store.materialize(job.source_storage_key, join(workDir, 'source'));
+      const logoPath = job.include_logo ? await this.logoPathFor(job.logo_asset_id, workDir) : null;
+      await assertFile(sourcePath, 'source asset');
       if (job.include_logo && logoPath) await assertFile(logoPath, job.logo_asset_id ? 'selected brand asset' : 'BRAND_LOGO_PATH');
       if (job.caption_mode === 'burned' && this.brandFontPath) await assertFile(this.brandFontPath, 'BRAND_FONT_PATH');
 
       await this.updateProgress(renderId, 20);
-      const workDir = join(process.env.TMPDIR ?? '/tmp', 'clipper-renders', renderId);
-      await mkdir(workDir, { recursive: true });
       const captions = job.caption_mode === 'none' ? { srt: null, ass: null, count: 0 } : await this.prepareCaptions(job.transcript_id, startSeconds, endSeconds, profile, workDir);
       const headlineCards = readHeadlineCards(job.social_copy);
       const nameTags = readNameTags(job.social_copy);
       await this.updateProgress(renderId, 35);
       const outputPath = join(workDir, 'clip.mp4');
-      await this.renderVideo(job, profile, job.fit_mode, job.background, job.logo_position, logoPath, startSeconds, endSeconds, job.caption_mode === 'burned' ? captions.ass : null, headlineCards, nameTags, workDir, outputPath);
+      await this.renderVideo(job, sourcePath, profile, job.fit_mode, job.background, job.logo_position, logoPath, startSeconds, endSeconds, job.caption_mode === 'burned' ? captions.ass : null, headlineCards, nameTags, workDir, outputPath);
       const thumbnailPath = join(workDir, 'thumbnail.jpg');
-      await this.renderThumbnail(job, profile, job.fit_mode, job.background, startSeconds, thumbnailPath);
+      await this.renderThumbnail(sourcePath, profile, job.fit_mode, job.background, startSeconds, thumbnailPath);
       await this.updateProgress(renderId, 70);
 
       const videoAsset = await this.storeFileAsset(job.source_id, `renders/${renderId}/clip.mp4`, outputPath, 'video/mp4', 'render');
@@ -133,13 +134,13 @@ export class RenderProcessor {
       const manifestAsset = await this.storeBufferAsset(job.source_id, `renders/${renderId}/render-manifest.json`, Buffer.from(JSON.stringify(manifest, null, 2)), 'application/json', 'render');
       await this.updateProgress(renderId, 90);
       await this.db.query("UPDATE clip_renders SET status='completed', progress=100, completed_at=now(), lease_expires_at=NULL, asset_id=$2, thumbnail_asset_id=$3, caption_asset_id=$4, manifest_asset_id=$5, render_manifest=$6, error=NULL, updated_at=now() WHERE id=$1", [renderId, videoAsset.id, thumbnailAsset.id, captionAsset?.id ?? null, manifestAsset.id, JSON.stringify(manifest)]);
-      await rm(workDir, { recursive: true, force: true });
       return renderId;
     } catch (error) {
       await this.db.query("UPDATE clip_renders SET status='failed', error=$2, lease_expires_at=NULL, updated_at=now() WHERE id=$1", [renderId, error instanceof Error ? error.message : 'render failed']);
       throw error;
     } finally {
       if (heartbeat) clearInterval(heartbeat);
+      await rm(workDir, { recursive: true, force: true });
     }
   }
 
@@ -161,20 +162,20 @@ export class RenderProcessor {
     return { srt: srtPath, ass: assPath, count: segments.length };
   }
 
-  private async logoPathFor(logoAssetId: string | null) {
+  private async logoPathFor(logoAssetId: string | null, workDir: string) {
     if (!logoAssetId) return this.brandLogoPath;
     const result = await this.db.query('SELECT a.storage_key FROM brand_assets b JOIN assets a ON a.id=b.asset_id WHERE b.id=$1 AND b.active=true', [logoAssetId]);
     if (!result.rowCount) throw new Error(`Brand asset ${logoAssetId} was not found or is inactive`);
-    return this.store.getPath(result.rows[0].storage_key as string);
+    return this.store.materialize(result.rows[0].storage_key as string, join(workDir, 'brand'));
   }
 
-  private async renderVideo(job: RenderJobRow, profile: typeof renderProfiles[RenderProfileName], fitMode: RenderFitMode, background: RenderBackground, logoPosition: LogoPosition, logoPath: string | null, startSeconds: number, endSeconds: number, assPath: string | null, headlineCards: HeadlineCardInput[], nameTags: NameTagInput[], workDir: string, outputPath: string) {
+  private async renderVideo(job: RenderJobRow, sourcePath: string, profile: typeof renderProfiles[RenderProfileName], fitMode: RenderFitMode, background: RenderBackground, logoPosition: LogoPosition, logoPath: string | null, startSeconds: number, endSeconds: number, assPath: string | null, headlineCards: HeadlineCardInput[], nameTags: NameTagInput[], workDir: string, outputPath: string) {
     const fontsDir = this.brandFontPath ? `:fontsdir=${escapeFilterPath(dirname(this.brandFontPath))}` : '';
     const headlineFilter = await buildHeadlineCardFilter(headlineCards, endSeconds - startSeconds, profile, workDir, this.brandFontPath);
     const nameTagFilter = await buildNameTagFilter(nameTags, endSeconds - startSeconds, profile, workDir, this.brandFontPath);
     const baseFilter = `${baseVideoFilter(profile, fitMode, background)}${headlineFilter}${nameTagFilter}${assPath ? `,subtitles=${escapeFilterPath(assPath)}${fontsDir}` : ''}`;
     const duration = (endSeconds - startSeconds).toFixed(3);
-    const args = ['-y', '-ss', startSeconds.toFixed(3), '-i', this.store.getPath(job.source_storage_key)];
+    const args = ['-y', '-ss', startSeconds.toFixed(3), '-i', sourcePath];
     if (job.include_logo && logoPath) {
       const position = logoOverlayPosition(profile, logoPosition);
       args.push('-loop', '1', '-i', logoPath, '-filter_complex', `[0:v]${baseFilter}[base];[1:v]scale=-1:${profile.logoHeight}[logo];[base][logo]overlay=${position.x}:${position.y}:format=auto[v]`, '-map', '[v]');
@@ -185,8 +186,8 @@ export class RenderProcessor {
     await runCommand(this.ffmpegBinary, args);
   }
 
-  private async renderThumbnail(job: RenderJobRow, profile: typeof renderProfiles[RenderProfileName], fitMode: RenderFitMode, background: RenderBackground, startSeconds: number, outputPath: string) {
-    await runCommand(this.ffmpegBinary, ['-y', '-ss', startSeconds.toFixed(3), '-i', this.store.getPath(job.source_storage_key), '-frames:v', '1', '-vf', baseVideoFilter(profile, fitMode, background), '-q:v', '2', outputPath]);
+  private async renderThumbnail(sourcePath: string, profile: typeof renderProfiles[RenderProfileName], fitMode: RenderFitMode, background: RenderBackground, startSeconds: number, outputPath: string) {
+    await runCommand(this.ffmpegBinary, ['-y', '-ss', startSeconds.toFixed(3), '-i', sourcePath, '-frames:v', '1', '-vf', baseVideoFilter(profile, fitMode, background), '-q:v', '2', outputPath]);
   }
 
   private async storeFileAsset(sourceId: string, key: string, path: string, contentType: string, role: 'render' | 'transcript') {
@@ -329,8 +330,6 @@ async function buildNameTagFilter(tags: NameTagInput[], clipDuration: number, pr
     await writeFile(namePath, tag.name || 'Name', 'utf8');
     await writeFile(titlePath, tag.title || 'Title', 'utf8');
     const style = headlineStyle(tag.color);
-    const x = `(w*${(tag.xPercent / 100).toFixed(3)})-(w*${(tag.widthPercent / 100).toFixed(3)})/2`;
-    const y = `(h*${(tag.yPercent / 100).toFixed(3)})-(h*${(tag.heightPercent / 100).toFixed(3)})/2`;
     const nameSize = Math.max(14, Math.min(profile.height >= 1800 ? 42 : 32, profile.width * tag.widthPercent / 100 / Math.max(8, (tag.name || 'Name').length * 0.58), profile.height * tag.heightPercent / 100 / 3.1) * 0.8);
     const titleSize = Math.max(9, Math.round(nameSize * 0.58));
     const font = fontPath ? `fontfile='${escapeFilterPath(fontPath)}'` : '';

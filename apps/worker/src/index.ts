@@ -1,9 +1,9 @@
 import pg from 'pg';
 import { MediaProcessor, RenderProcessor } from '@clipper/processing';
-import { LocalAssetStore } from '@clipper/storage';
+import { createAssetStore } from '@clipper/storage';
 
 const db = new pg.Pool({ connectionString: process.env.DATABASE_URL });
-const store = new LocalAssetStore(process.env.ASSET_DATA_DIR ?? '/data');
+const store = createAssetStore();
 const mediaWorker = new MediaProcessor(db, store, Number(process.env.LEASE_SECONDS ?? 60));
 const renderWorker = new RenderProcessor(db, store, Number(process.env.RENDER_LEASE_SECONDS ?? process.env.LEASE_SECONDS ?? 60));
 const concurrency = Number(process.env.WORKER_CONCURRENCY ?? 1);

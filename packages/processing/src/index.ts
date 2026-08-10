@@ -5,7 +5,7 @@ import { basename, extname, join } from 'node:path';
 import { Readable, Transform } from 'node:stream';
 import { promisify } from 'node:util';
 import pg from 'pg';
-import { LocalAssetStore } from '@clipper/storage';
+import { AssetStore } from '@clipper/storage';
 import { CandidateProposal, EditorialCandidateProvider, createEditorialCandidateProvider } from './candidates.js';
 import { createPlatformSourceAdapter, PlatformSourceAdapter } from './source-adapters.js';
 export { RenderProcessor, buildAss, buildSrt, formatSrtTime, renderProfiles } from './rendering.js';
@@ -194,7 +194,7 @@ export class MediaProcessor {
 
   constructor(
     private readonly db: pg.Pool,
-    private readonly store: LocalAssetStore,
+    private readonly store: AssetStore,
     private readonly leaseSeconds = 60,
     options: { transcriber?: TranscriptionProvider; candidateProvider?: EditorialCandidateProvider; ffprobeBinary?: string; maxSourceBytes?: number; platformSourceAdapter?: PlatformSourceAdapter | null } = {},
   ) {
@@ -217,6 +217,7 @@ export class MediaProcessor {
     if (!claim.rowCount) return null;
     const job = claim.rows[0] as { id: string; source_id: string; mode: string };
     let youtubeSourceId: string | null = null;
+    const mediaWorkDir = join(process.env.TMPDIR ?? '/tmp', 'clipper-media', job.id);
 
     try {
       const sourceResult = await this.db.query('SELECT * FROM media_sources WHERE id=$1', [job.source_id]);
@@ -227,9 +228,10 @@ export class MediaProcessor {
 
       await this.updateProgress(job.id, 15);
       const sourceAsset = await this.ensureSourceAsset(source, job.id);
+      const sourcePath = await this.store.materialize(sourceAsset.storageKey, mediaWorkDir);
       if (youtubeSourceId) await this.updateYouTubeIngestion(youtubeSourceId, 'asset_registered');
       await this.updateProgress(job.id, 45);
-      const probe = await this.probeSource(source.id, sourceAsset.storageKey, sourceAsset.contentType, sourceAsset.byteSize);
+      const probe = await this.probeSource(source.id, sourcePath, sourceAsset.contentType, sourceAsset.byteSize);
       await this.updateProgress(job.id, 70);
 
       const result: Record<string, unknown> = {
@@ -238,7 +240,7 @@ export class MediaProcessor {
       };
       if (job.mode === 'transcribe_only' || job.mode === 'find_moments') {
         if (youtubeSourceId) await this.updateYouTubeIngestion(youtubeSourceId, 'processing');
-        const transcript = await this.transcribe(job.id, source.id, sourceAsset.storageKey, probe.durationSeconds);
+        const transcript = await this.transcribe(job.id, source.id, sourcePath, probe.durationSeconds);
         result.transcriptId = transcript.id;
         if (job.mode === 'find_moments') {
           const candidateCount = await this.persistCandidates(job.id, transcript.id, transcript.segments, probe.durationSeconds);
@@ -261,6 +263,8 @@ export class MediaProcessor {
         }
       }
       throw error;
+    } finally {
+      await rm(mediaWorkDir, { recursive: true, force: true });
     }
   }
 
@@ -276,7 +280,6 @@ export class MediaProcessor {
     const existing = await this.db.query("SELECT id, storage_key, content_type, byte_size FROM assets WHERE source_id=$1 AND role='source' ORDER BY created_at DESC LIMIT 1", [source.id]);
     if (existing.rowCount) {
       const asset = existing.rows[0];
-      this.store.getPath(asset.storage_key);
       return { assetId: asset.id as string, storageKey: asset.storage_key as string, contentType: asset.content_type as string | null, byteSize: asset.byte_size as number | null };
     }
     if (source.source_type === 'upload') throw new Error(`Uploaded source ${source.id} has no stored asset`);
@@ -314,8 +317,7 @@ export class MediaProcessor {
     return { assetId: asset.rows[0].id as string, storageKey: key, contentType, byteSize: result.byteSize };
   }
 
-  private async probeSource(sourceId: string, storageKey: string, contentType: string | null, byteSize: number | null) {
-    const path = this.store.getPath(storageKey);
+  private async probeSource(sourceId: string, path: string, contentType: string | null, byteSize: number | null) {
     await this.db.query("INSERT INTO source_probes(source_id,status,content_type,byte_size,updated_at) VALUES($1,'processing',$2,$3,now()) ON CONFLICT(source_id) DO UPDATE SET status='processing', error=NULL, content_type=EXCLUDED.content_type, byte_size=EXCLUDED.byte_size, updated_at=now()", [sourceId, contentType, byteSize]);
     try {
       const { stdout } = await execFile(this.ffprobeBinary, ['-v', 'error', '-print_format', 'json', '-show_format', '-show_streams', path], { maxBuffer: 4 * 1024 * 1024 });
@@ -328,11 +330,11 @@ export class MediaProcessor {
     }
   }
 
-  private async transcribe(jobId: string, _sourceId: string, storageKey: string, durationSeconds: number | null) {
+  private async transcribe(jobId: string, _sourceId: string, mediaPath: string, durationSeconds: number | null) {
     const transcript = await this.db.query("INSERT INTO transcripts(job_id,status,provider,duration_seconds,updated_at) VALUES($1,'processing',$2,$3,now()) ON CONFLICT(job_id) DO UPDATE SET status='processing', provider=EXCLUDED.provider, error=NULL, updated_at=now() RETURNING id", [jobId, this.transcriber.constructor.name, durationSeconds]);
     const transcriptId = transcript.rows[0].id as string;
     try {
-      const result = await this.transcriber.transcribe({ mediaPath: this.store.getPath(storageKey), workDir: join(process.env.TMPDIR ?? '/tmp', 'clipper-transcripts', jobId) });
+      const result = await this.transcriber.transcribe({ mediaPath, workDir: join(process.env.TMPDIR ?? '/tmp', 'clipper-transcripts', jobId) });
       const segments = result.segments.flatMap((segment) => {
         const text = sanitizeTranscriptText(segment.text);
         return text ? [{ ...segment, text }] : [];

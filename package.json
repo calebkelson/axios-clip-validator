@@ -13,6 +13,7 @@
     "db:validate": "tsx db/migrate.ts --validate",
     "db:backfill-youtube": "tsx db/backfill-youtube.ts",
     "db:import-retention": "tsx scripts/import-youtube-retention.ts",
+    "assets:migrate-r2": "tsx scripts/migrate-assets-to-r2.ts",
     "captions:rewrite": "tsx scripts/rewrite-captions.ts",
     "captions:rewrite:model": "tsx scripts/rewrite-captions.ts --model",
     "titles:rewrite:model": "tsx scripts/rewrite-captions.ts --model --titles"

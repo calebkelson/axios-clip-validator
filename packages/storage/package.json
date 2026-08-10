@@ -1,1 +1,1 @@
-{ "name": "@clipper/storage", "type": "module", "exports": "./dist/index.js", "scripts": { "build": "tsc -b", "test": "node --test dist/**/*.test.js" } }
+{"name":"@clipper/storage","type":"module","exports":"./dist/index.js","scripts":{"build":"tsc -b","test":"node --test dist/**/*.test.js"},"dependencies":{"@aws-sdk/client-s3":"^3.1106.0","@aws-sdk/lib-storage":"^3.1106.0"}}
