@@ -1,0 +1,1 @@
+{ "name": "@clipper/worker", "type": "module", "scripts": { "build": "tsc -b", "test": "node --test dist/test/**/*.test.js", "start": "node dist/index.js", "dev": "tsx watch src/index.ts" }, "dependencies": { "@clipper/processing": "workspace:*", "@clipper/storage": "workspace:*", "pg": "^8.16.0" }, "devDependencies": { "@types/pg": "^8.15.1" } }

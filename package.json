@@ -1,0 +1,21 @@
+{
+  "name": "axios-clipping-platform",
+  "type": "module",
+  "private": true,
+  "packageManager": "pnpm@11.9.0",
+  "engines": { "node": ">=22" },
+  "scripts": {
+    "build": "pnpm -r build",
+    "lint": "eslint .",
+    "typecheck": "tsc -b",
+    "test": "pnpm -r test",
+    "db:migrate": "tsx db/migrate.ts",
+    "db:validate": "tsx db/migrate.ts --validate",
+    "db:backfill-youtube": "tsx db/backfill-youtube.ts",
+    "db:import-retention": "tsx scripts/import-youtube-retention.ts",
+    "captions:rewrite": "tsx scripts/rewrite-captions.ts",
+    "captions:rewrite:model": "tsx scripts/rewrite-captions.ts --model",
+    "titles:rewrite:model": "tsx scripts/rewrite-captions.ts --model --titles"
+  },
+  "devDependencies": { "@types/node": "^22.15.3", "@types/pg": "^8.15.1", "@typescript-eslint/eslint-plugin": "^8.33.0", "@typescript-eslint/parser": "^8.33.0", "eslint": "^9.27.0", "pg": "^8.16.0", "tsx": "^4.19.4", "typescript": "^5.8.3" }
+}
