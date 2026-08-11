@@ -47,6 +47,9 @@ export const AudienceSignalSchema = z.object({
   totalSegmentImpressions: z.number().int().nonnegative(),
   intervalCount: z.number().int().positive(),
   raw: z.object({
+    startAudienceWatchRatio: z.number().nullable().optional(),
+    endAudienceWatchRatio: z.number().nullable().optional(),
+    startStartedWatching: z.number().nullable().optional(),
     peakAudienceWatchRatio: z.number().nullable(),
     medianAudienceWatchRatio: z.number().nullable(),
     peakLocalRewatchLift: z.number().nullable(),
