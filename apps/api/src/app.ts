@@ -118,6 +118,46 @@ const toRender = (row: Record<string, any>) => RenderSchema.parse({
   completedAt: row.completed_at?.toISOString?.() ?? null,
 });
 
+type AudienceRetentionRow = {
+  segment_start_seconds: number | string;
+  segment_end_seconds: number | string;
+  audience_watch_ratio: number | string;
+  started_watching: number | string;
+};
+
+function hydrateAudienceSignal(signal: unknown, points: AudienceRetentionRow[], startSeconds: number, endSeconds: number) {
+  if (!signal || typeof signal !== 'object' || !points.length) return signal;
+  const ordered = points
+    .map((point) => ({
+      start: Number(point.segment_start_seconds),
+      end: Number(point.segment_end_seconds),
+      watchRatio: Number(point.audience_watch_ratio),
+      startedWatching: Number(point.started_watching),
+    }))
+    .filter((point) => Number.isFinite(point.start) && Number.isFinite(point.end) && Number.isFinite(point.watchRatio) && Number.isFinite(point.startedWatching));
+  if (!ordered.length) return signal;
+
+  const selected = ordered.filter((point) => point.end > startSeconds && point.start < endSeconds);
+  const nearest = (target: number) => ordered.reduce((closest, point) => {
+    const distance = point.end < target ? target - point.end : point.start - target;
+    const closestDistance = closest.end < target ? target - closest.end : closest.start - target;
+    return distance < closestDistance ? point : closest;
+  }, ordered[0]);
+  const startPoint = selected[0] ?? nearest(startSeconds);
+  const endPoint = selected.at(-1) ?? nearest(endSeconds);
+  const raw = (signal as { raw?: unknown }).raw;
+  const existingRaw = raw && typeof raw === 'object' ? raw as Record<string, unknown> : {};
+  return {
+    ...(signal as Record<string, unknown>),
+    raw: {
+      ...existingRaw,
+      startAudienceWatchRatio: existingRaw.startAudienceWatchRatio ?? startPoint.watchRatio,
+      endAudienceWatchRatio: existingRaw.endAudienceWatchRatio ?? endPoint.watchRatio,
+      startStartedWatching: existingRaw.startStartedWatching ?? startPoint.startedWatching,
+    },
+  };
+}
+
 const toBrandAsset = (row: Record<string, any>) => BrandAssetSchema.parse({
   id: row.id,
   name: row.name,
@@ -514,7 +554,7 @@ export function buildApp(db: pg.Pool, store: AssetStore, maxUploadBytes = 5_000_
     if (!source.rowCount) return reply.code(404).send({ error: 'audience_source_not_found' });
     const videoId = source.rows[0].video_id as string;
     const current = await db.query(`
-      SELECT s.signal, s.classifications, s.trend
+      SELECT s.import_id, s.start_seconds, s.end_seconds, s.signal, s.classifications, s.trend
       FROM youtube_audience_clip_snapshots s
       WHERE s.candidate_id=$1
       ORDER BY s.collected_at DESC
@@ -528,7 +568,18 @@ export function buildApp(db: pg.Pool, store: AssetStore, maxUploadBytes = 5_000_
       ORDER BY audience_signal DESC, start_seconds
     `, [videoId]);
     const history = await db.query('SELECT audience_signal, collected_at, classifications FROM youtube_audience_clip_snapshots WHERE candidate_id=$1 ORDER BY collected_at', [candidateId]);
-    const signal = current.rowCount ? AudienceSignalSchema.parse({ ...current.rows[0].signal, classifications: current.rows[0].classifications ?? current.rows[0].signal?.classifications ?? [], trend: current.rows[0].trend ?? current.rows[0].signal?.trend ?? null }) : null;
+    let hydratedSignal = current.rowCount ? current.rows[0].signal : null;
+    if (current.rowCount && current.rows[0].import_id) {
+      const retention = await db.query<AudienceRetentionRow>(
+        `SELECT segment_start_seconds, segment_end_seconds, audience_watch_ratio, started_watching
+         FROM youtube_retention_points
+         WHERE video_id=$1 AND import_id=$2
+         ORDER BY segment_number, segment_start_seconds`,
+        [videoId, current.rows[0].import_id],
+      );
+      hydratedSignal = hydrateAudienceSignal(hydratedSignal, retention.rows, Number(current.rows[0].start_seconds), Number(current.rows[0].end_seconds));
+    }
+    const signal = current.rowCount ? AudienceSignalSchema.parse({ ...hydratedSignal, classifications: current.rows[0].classifications ?? hydratedSignal?.classifications ?? [], trend: current.rows[0].trend ?? hydratedSignal?.trend ?? null }) : null;
     return {
       videoId,
       youtubeVideoId: source.rows[0].youtube_video_id,
