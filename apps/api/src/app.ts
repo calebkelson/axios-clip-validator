@@ -76,6 +76,8 @@ const toCandidate = (row: Record<string, any>) => {
       ...(copy.optionalCta === null || typeof copy.optionalCta === 'string' ? { optionalCta: copy.optionalCta } : {}),
       headlineCards: Array.isArray(copy.headlineCards) ? copy.headlineCards : [],
       nameTags: Array.isArray(copy.nameTags) ? copy.nameTags : [],
+      ...(copy.transcriptEdits !== undefined ? { transcriptEdits: copy.transcriptEdits } : {}),
+      ...(copy.subtitlePosition !== undefined ? { subtitlePosition: copy.subtitlePosition } : {}),
     },
     audienceSignal,
     metadata: row.metadata && typeof row.metadata === 'object' ? row.metadata : {},
@@ -101,6 +103,7 @@ const toRender = (row: Record<string, any>) => RenderSchema.parse({
   logoAssetId: row.logo_asset_id ?? null,
   captionMode: row.caption_mode,
   includeLogo: row.include_logo,
+  renderSpec: row.render_spec ?? null,
   status: row.status,
   progress: row.progress,
   attempts: row.attempts,
@@ -229,7 +232,7 @@ const dashboardSelect = `
     p.status AS probe_status, p.duration_seconds, p.width, p.height,
     sa.id AS source_asset_id,
     r.id AS render_id, r.profile AS render_profile, r.fit_mode AS render_fit_mode, r.background AS render_background, r.logo_position AS render_logo_position, r.logo_asset_id AS render_logo_asset_id, r.caption_mode AS render_caption_mode,
-    r.include_logo AS render_include_logo, r.status AS render_status, r.progress AS render_progress,
+    r.include_logo AS render_include_logo, r.render_spec AS render_spec, r.status AS render_status, r.progress AS render_progress,
     r.attempts AS render_attempts, r.error AS render_error, r.asset_id AS render_asset_id,
     r.caption_asset_id AS render_caption_asset_id, r.thumbnail_asset_id AS render_thumbnail_asset_id,
     r.manifest_asset_id AS render_manifest_asset_id, r.render_manifest, r.created_at AS render_created_at,
@@ -275,6 +278,7 @@ const toDashboardClip = (row: Record<string, any>) => {
     logo_asset_id: row.render_logo_asset_id ?? null,
     caption_mode: row.render_caption_mode,
     include_logo: row.render_include_logo,
+    render_spec: row.render_spec,
     status: row.render_status,
     progress: row.render_progress,
     attempts: row.render_attempts,
@@ -621,7 +625,7 @@ export function buildApp(db: pg.Pool, store: AssetStore, maxUploadBytes = 5_000_
       const logo = await db.query('SELECT 1 FROM brand_assets WHERE id=$1 AND active=true', [input.logoAssetId]);
       if (!logo.rowCount) return reply.code(400).send({ error: 'brand_asset_not_found' });
     }
-    const result = await db.query('INSERT INTO clip_renders(candidate_id,profile,fit_mode,background,logo_position,logo_asset_id,caption_mode,include_logo) VALUES($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *', [candidateId, input.profile, input.fitMode, input.background, input.logoPosition, input.logoAssetId, input.captionMode, input.includeLogo]);
+    const result = await db.query('INSERT INTO clip_renders(candidate_id,profile,fit_mode,background,logo_position,logo_asset_id,caption_mode,include_logo,render_spec) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *', [candidateId, input.profile, input.fitMode, input.background, input.logoPosition, input.logoAssetId, input.captionMode, input.includeLogo, input.renderSpec ?? null]);
     return reply.code(201).send(toRender(result.rows[0]));
   });
 
