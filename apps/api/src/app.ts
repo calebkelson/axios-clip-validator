@@ -298,7 +298,8 @@ function dashboardSelect(smartSearch = false) {
     LIMIT 1
   ) audience ON true
   WHERE ($1::uuid IS NULL OR c.id=$1)
-    AND ${smartSearch ? dashboardSearchPredicate() : `($2::text IS NULL OR c.metadata::text ILIKE $2 OR c.social_copy::text ILIKE $2 OR s.metadata::text ILIKE $2 OR s.uri ILIKE $2
+    AND ${smartSearch ? `${dashboardSearchPredicate()}
+      AND $2::text IS NULL` : `($2::text IS NULL OR c.metadata::text ILIKE $2 OR c.social_copy::text ILIKE $2 OR s.metadata::text ILIKE $2 OR s.uri ILIKE $2
       OR EXISTS (SELECT 1 FROM transcripts t WHERE t.job_id=c.job_id AND t.full_text ILIKE $2)
       OR EXISTS (SELECT 1 FROM transcripts t JOIN transcript_segments ts ON ts.transcript_id=t.id WHERE t.job_id=c.job_id AND ts.text ILIKE $2))`}
   ORDER BY ${smartSearch ? 'search_rank DESC, ' : ''}y.published_at DESC NULLS LAST, y.upload_date DESC NULLS LAST, c.created_at DESC
@@ -307,8 +308,9 @@ function dashboardSelect(smartSearch = false) {
 
 async function loadDashboardRows(db: pg.Pool, candidateId: string | null, query: string | null, limit: number, searchPlan: SearchPlan | null = null) {
   const smartSearch = Boolean(searchPlan);
-  const params: unknown[] = [candidateId, smartSearch ? null : query ? `%${query}%` : null, limit];
-  if (searchPlan) params.push(searchPlan.exactPhrase, searchPlan.exactTerms, searchPlan.relatedTerms);
+  const params: unknown[] = smartSearch && searchPlan
+    ? [candidateId, null, limit, searchPlan.exactPhrase, searchPlan.exactTerms, searchPlan.relatedTerms]
+    : [candidateId, query ? `%${query}%` : null, limit];
   return (await db.query(dashboardSelect(smartSearch), params)).rows;
 }
 
