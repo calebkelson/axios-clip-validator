@@ -233,15 +233,28 @@ const searchEvidenceSql = "lower(concat_ws(' ', COALESCE(c.evidence::text,''), C
 const searchAllTextSql = `lower(concat_ws(' ', ${searchHeadlineSql}, ${searchSourceSql}, ${searchCaptionSql}, ${searchEvidenceSql}))`;
 
 function transcriptSearchSql(termExpression: string) {
-  return `EXISTS (SELECT 1 FROM transcripts t WHERE t.job_id=c.job_id AND (lower(COALESCE(t.full_text,'')) LIKE '%' || lower(${termExpression}) || '%' OR EXISTS (SELECT 1 FROM transcript_segments ts WHERE ts.transcript_id=t.id AND lower(ts.text) LIKE '%' || lower(${termExpression}) || '%'))) `;
+  return `EXISTS (
+    SELECT 1
+    FROM transcripts t
+    WHERE t.job_id=c.job_id
+      AND (
+        lower(COALESCE(t.full_text,'')) LIKE '%' || lower(${termExpression}) || '%'
+        OR EXISTS (
+          SELECT 1
+          FROM transcript_segments ts
+          WHERE ts.transcript_id=t.id
+            AND lower(ts.text) LIKE '%' || lower(${termExpression}) || '%'
+        )
+      )
+  ) `;
 }
 
 function dashboardSearchPredicate() {
   return `($4::text IS NULL OR (
     ${searchAllTextSql} LIKE '%' || lower($4) || '%'
     OR ${transcriptSearchSql('$4')}
-    OR EXISTS (SELECT 1 FROM unnest($5::text[]) AS exact_term(value) WHERE ${searchAllTextSql} LIKE '%' || lower(exact_term.value) || '%' OR ${transcriptSearchSql('exact_term.value')})
-    OR EXISTS (SELECT 1 FROM unnest($6::text[]) AS related_term(value) WHERE ${searchAllTextSql} LIKE '%' || lower(related_term.value) || '%' OR ${transcriptSearchSql('related_term.value')})
+    OR EXISTS (SELECT 1 FROM unnest($5::text[]) AS exact_term(value) WHERE ${searchAllTextSql} LIKE '%' || lower(exact_term.value) || '%')
+    OR EXISTS (SELECT 1 FROM unnest($6::text[]) AS related_term(value) WHERE ${searchAllTextSql} LIKE '%' || lower(related_term.value) || '%')
   ))`;
 }
 
@@ -255,8 +268,8 @@ function dashboardSearchRank() {
     + (SELECT COUNT(*) * 8 FROM unnest($5::text[]) AS exact_term(value) WHERE ${searchHeadlineSql} LIKE '%' || lower(exact_term.value) || '%')
     + (SELECT COUNT(*) * 6 FROM unnest($5::text[]) AS exact_term(value) WHERE ${searchSourceSql} LIKE '%' || lower(exact_term.value) || '%')
     + (SELECT COUNT(*) * 4 FROM unnest($5::text[]) AS exact_term(value) WHERE ${searchCaptionSql} LIKE '%' || lower(exact_term.value) || '%')
-    + (SELECT COUNT(*) * 3 FROM unnest($5::text[]) AS exact_term(value) WHERE ${searchEvidenceSql} LIKE '%' || lower(exact_term.value) || '%' OR ${transcriptSearchSql('exact_term.value')})
-    + (SELECT COUNT(*) * 3 FROM unnest($6::text[]) AS related_term(value) WHERE ${searchAllTextSql} LIKE '%' || lower(related_term.value) || '%' OR ${transcriptSearchSql('related_term.value')})
+    + (SELECT COUNT(*) * 3 FROM unnest($5::text[]) AS exact_term(value) WHERE ${searchEvidenceSql} LIKE '%' || lower(exact_term.value) || '%')
+    + (SELECT COUNT(*) * 3 FROM unnest($6::text[]) AS related_term(value) WHERE ${searchAllTextSql} LIKE '%' || lower(related_term.value) || '%')
     + (COALESCE(c.confidence, 0) * 5)
   END AS search_rank`;
 }
