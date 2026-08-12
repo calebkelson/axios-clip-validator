@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import { createReadStream, createWriteStream } from 'node:fs';
-import { mkdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
+import { copyFile, mkdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
 import { extname, join, resolve } from 'node:path';
 import { Readable, Transform } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
@@ -160,11 +160,41 @@ export class R2AssetStore implements AssetStore {
     const digest = createHash('sha256').update(safeKey).digest('hex');
     const path = join(workDir, `${digest}${extname(safeKey) || '.asset'}`);
     try {
-      const asset = await this.getStream(safeKey);
-      await pipeline(asset.stream, createWriteStream(path));
+      await this.materializeCachedObject(safeKey, path);
       return path;
     } catch (error) {
       await rm(path, { force: true });
+      throw error;
+    }
+  }
+
+  private async materializeCachedObject(key: string, destination: string) {
+    const safeKey = assertAssetKey(key);
+    const head = await this.client.send(new HeadObjectCommand({ Bucket: this.bucket, Key: safeKey }));
+    const fingerprint = { key: safeKey, etag: head.ETag ?? null, contentLength: Number(head.ContentLength ?? 0), lastModified: head.LastModified?.toISOString() ?? null };
+    const digest = createHash('sha256').update(safeKey).digest('hex');
+    const extension = extname(safeKey) || '.asset';
+    const dataPath = join(this.cacheDir, `${digest}${extension}`);
+    const metadataPath = join(this.cacheDir, `${digest}.meta.json`);
+    await mkdir(this.cacheDir, { recursive: true });
+    try {
+      const metadata = JSON.parse(await readFile(metadataPath, 'utf8')) as typeof fingerprint;
+      const cached = await stat(dataPath);
+      if (metadata.key === fingerprint.key && metadata.etag === fingerprint.etag && metadata.contentLength === fingerprint.contentLength && metadata.lastModified === fingerprint.lastModified && cached.size === fingerprint.contentLength) {
+        await copyFile(dataPath, destination);
+        return;
+      }
+    } catch { /* Cache miss or stale entry. */ }
+    const temporaryPath = `${dataPath}.tmp-${process.pid}-${Date.now()}`;
+    try {
+      const response = await this.client.send(new GetObjectCommand({ Bucket: this.bucket, Key: safeKey }));
+      if (!response.Body) throw new Error('R2 returned an empty asset body');
+      await pipeline(toNodeReadable(response.Body), createWriteStream(temporaryPath));
+      await rename(temporaryPath, dataPath);
+      await writeFile(metadataPath, JSON.stringify(fingerprint));
+      await copyFile(dataPath, destination);
+    } catch (error) {
+      await rm(temporaryPath, { force: true });
       throw error;
     }
   }
