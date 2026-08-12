@@ -7,6 +7,7 @@ import { AssetStore } from '@clipper/storage';
 import { ZodError } from 'zod';
 import { YouTubeCatalogSync, YouTubeDataApiClient, YouTubeSyncError } from './youtube-sync.js';
 import { YouTubeIngestionService } from './youtube-ingestion.js';
+import { expandSearchQuery, type SearchPlan } from './search.js';
 
 const toJob = (row: Record<string, any>) => JobSchema.parse({
   id: row.id,
@@ -225,7 +226,43 @@ const toYouTubeChannel = (row: Record<string, any>) => YouTubeChannelSchema.pars
   updatedAt: row.updated_at.toISOString(),
 });
 
-const dashboardSelect = `
+const searchHeadlineSql = "lower(concat_ws(' ', COALESCE(c.social_copy->>'headline',''), COALESCE(c.social_copy->>'hook',''), COALESCE(c.social_copy->>'headlineCards','')))";
+const searchSourceSql = "lower(concat_ws(' ', COALESCE(y.title,''), COALESCE(y.description,''), COALESCE(s.metadata->>'title',''), COALESCE(s.metadata->>'name',''), COALESCE(s.metadata->>'channelName',''), COALESCE(s.uri,'')))";
+const searchCaptionSql = "lower(concat_ws(' ', COALESCE(c.social_copy->>'caption',''), COALESCE(c.social_copy->>'hashtags',''), COALESCE(c.social_copy->>'optionalCta','')))";
+const searchEvidenceSql = "lower(concat_ws(' ', COALESCE(c.evidence::text,''), COALESCE(c.metadata::text,'')))";
+const searchAllTextSql = `lower(concat_ws(' ', ${searchHeadlineSql}, ${searchSourceSql}, ${searchCaptionSql}, ${searchEvidenceSql}))`;
+
+function transcriptSearchSql(termExpression: string) {
+  return `EXISTS (SELECT 1 FROM transcripts t WHERE t.job_id=c.job_id AND (lower(COALESCE(t.full_text,'')) LIKE '%' || lower(${termExpression}) || '%' OR EXISTS (SELECT 1 FROM transcript_segments ts WHERE ts.transcript_id=t.id AND lower(ts.text) LIKE '%' || lower(${termExpression}) || '%'))) `;
+}
+
+function dashboardSearchPredicate() {
+  return `($4::text IS NULL OR (
+    ${searchAllTextSql} LIKE '%' || lower($4) || '%'
+    OR ${transcriptSearchSql('$4')}
+    OR EXISTS (SELECT 1 FROM unnest($5::text[]) AS exact_term(value) WHERE ${searchAllTextSql} LIKE '%' || lower(exact_term.value) || '%' OR ${transcriptSearchSql('exact_term.value')})
+    OR EXISTS (SELECT 1 FROM unnest($6::text[]) AS related_term(value) WHERE ${searchAllTextSql} LIKE '%' || lower(related_term.value) || '%' OR ${transcriptSearchSql('related_term.value')})
+  ))`;
+}
+
+function dashboardSearchRank() {
+  return `CASE WHEN $4::text IS NULL THEN 0 ELSE
+    (CASE WHEN ${searchHeadlineSql} LIKE '%' || lower($4) || '%' THEN 100 ELSE 0 END)
+    + (CASE WHEN ${searchSourceSql} LIKE '%' || lower($4) || '%' THEN 80 ELSE 0 END)
+    + (CASE WHEN ${searchCaptionSql} LIKE '%' || lower($4) || '%' THEN 45 ELSE 0 END)
+    + (CASE WHEN ${searchEvidenceSql} LIKE '%' || lower($4) || '%' THEN 35 ELSE 0 END)
+    + (CASE WHEN ${transcriptSearchSql('$4')} THEN 60 ELSE 0 END)
+    + (SELECT COUNT(*) * 8 FROM unnest($5::text[]) AS exact_term(value) WHERE ${searchHeadlineSql} LIKE '%' || lower(exact_term.value) || '%')
+    + (SELECT COUNT(*) * 6 FROM unnest($5::text[]) AS exact_term(value) WHERE ${searchSourceSql} LIKE '%' || lower(exact_term.value) || '%')
+    + (SELECT COUNT(*) * 4 FROM unnest($5::text[]) AS exact_term(value) WHERE ${searchCaptionSql} LIKE '%' || lower(exact_term.value) || '%')
+    + (SELECT COUNT(*) * 3 FROM unnest($5::text[]) AS exact_term(value) WHERE ${searchEvidenceSql} LIKE '%' || lower(exact_term.value) || '%' OR ${transcriptSearchSql('exact_term.value')})
+    + (SELECT COUNT(*) * 3 FROM unnest($6::text[]) AS related_term(value) WHERE ${searchAllTextSql} LIKE '%' || lower(related_term.value) || '%' OR ${transcriptSearchSql('related_term.value')})
+    + (COALESCE(c.confidence, 0) * 5)
+  END AS search_rank`;
+}
+
+function dashboardSelect(smartSearch = false) {
+  return `
   SELECT c.*, j.source_id, j.status AS job_status, j.progress AS job_progress, j.last_error AS job_error,
     s.source_type, s.media_type, s.uri AS source_uri, s.metadata AS source_metadata,
     y.published_at AS youtube_published_at, y.upload_date AS youtube_upload_date,
@@ -238,7 +275,7 @@ const dashboardSelect = `
     r.caption_asset_id AS render_caption_asset_id, r.thumbnail_asset_id AS render_thumbnail_asset_id,
     r.manifest_asset_id AS render_manifest_asset_id, r.render_manifest, r.created_at AS render_created_at,
     r.completed_at AS render_completed_at,
-    audience.signal AS audience_signal
+    audience.signal AS audience_signal${smartSearch ? `, ${dashboardSearchRank()}` : ''}
   FROM clip_candidates c
   JOIN processing_jobs j ON j.id=c.job_id
   JOIN media_sources s ON s.id=j.source_id
@@ -261,14 +298,18 @@ const dashboardSelect = `
     LIMIT 1
   ) audience ON true
   WHERE ($1::uuid IS NULL OR c.id=$1)
-    AND ($2::text IS NULL OR c.metadata::text ILIKE $2 OR c.social_copy::text ILIKE $2 OR s.metadata::text ILIKE $2 OR s.uri ILIKE $2
+    AND ${smartSearch ? dashboardSearchPredicate() : `($2::text IS NULL OR c.metadata::text ILIKE $2 OR c.social_copy::text ILIKE $2 OR s.metadata::text ILIKE $2 OR s.uri ILIKE $2
       OR EXISTS (SELECT 1 FROM transcripts t WHERE t.job_id=c.job_id AND t.full_text ILIKE $2)
-      OR EXISTS (SELECT 1 FROM transcripts t JOIN transcript_segments ts ON ts.transcript_id=t.id WHERE t.job_id=c.job_id AND ts.text ILIKE $2))
-  ORDER BY y.published_at DESC NULLS LAST, y.upload_date DESC NULLS LAST, c.created_at DESC
+      OR EXISTS (SELECT 1 FROM transcripts t JOIN transcript_segments ts ON ts.transcript_id=t.id WHERE t.job_id=c.job_id AND ts.text ILIKE $2))`}
+  ORDER BY ${smartSearch ? 'search_rank DESC, ' : ''}y.published_at DESC NULLS LAST, y.upload_date DESC NULLS LAST, c.created_at DESC
   LIMIT $3`;
+}
 
-async function loadDashboardRows(db: pg.Pool, candidateId: string | null, query: string | null, limit: number) {
-  return (await db.query(dashboardSelect, [candidateId, query ? `%${query}%` : null, limit])).rows;
+async function loadDashboardRows(db: pg.Pool, candidateId: string | null, query: string | null, limit: number, searchPlan: SearchPlan | null = null) {
+  const smartSearch = Boolean(searchPlan);
+  const params: unknown[] = [candidateId, smartSearch ? null : query ? `%${query}%` : null, limit];
+  if (searchPlan) params.push(searchPlan.exactPhrase, searchPlan.exactTerms, searchPlan.relatedTerms);
+  return (await db.query(dashboardSelect(smartSearch), params)).rows;
 }
 
 const toDashboardClip = (row: Record<string, any>) => {
@@ -653,9 +694,18 @@ export function buildApp(db: pg.Pool, store: AssetStore, maxUploadBytes = 5_000_
 
   app.get('/v1/dashboard/queue', async (request) => {
     const query = request.query as { q?: string; limit?: string };
+    const searchText = query.q?.trim() || '';
     const limit = Math.min(Math.max(Number(query.limit ?? 50) || 50, 1), 100);
-    const rows = await loadDashboardRows(db, null, query.q?.trim() || null, limit);
-    return { items: rows.map(toDashboardClip) };
+    const searchPlan = searchText ? await expandSearchQuery(searchText, {
+      apiKey: process.env.OPENAI_API_KEY,
+      model: process.env.OPENAI_SEARCH_MODEL ?? process.env.SEARCH_MODEL ?? 'gpt-4o-mini',
+      timeoutMs: Number(process.env.SEARCH_EXPANSION_TIMEOUT_MS ?? 700),
+    }) : null;
+    const rows = await loadDashboardRows(db, null, searchText || null, limit, searchPlan);
+    return {
+      items: rows.map(toDashboardClip),
+      ...(searchPlan ? { search: { ...searchPlan, resultRanks: rows.map((row) => Number(row.search_rank ?? 0)) } } : {}),
+    };
   });
 
   app.post('/v1/jobs/:jobId/cancel', async (request, reply) => {
@@ -668,8 +718,17 @@ export function buildApp(db: pg.Pool, store: AssetStore, maxUploadBytes = 5_000_
 
   app.get('/v1/clips', async () => ({ items: (await db.query('SELECT c.*, r.id AS render_id, r.asset_id FROM clip_candidates c LEFT JOIN clip_renders r ON r.candidate_id=c.id ORDER BY c.created_at DESC')).rows.map(toCandidate) }));
   app.get('/v1/clips/search', async (request) => {
-    const query = (request.query as { q?: string }).q ?? '';
-    return { items: (await db.query("SELECT c.* FROM clip_candidates c WHERE c.metadata::text ILIKE $1 OR c.social_copy::text ILIKE $1 OR EXISTS (SELECT 1 FROM transcripts t WHERE t.job_id=c.job_id AND t.full_text ILIKE $1) OR EXISTS (SELECT 1 FROM transcripts t JOIN transcript_segments s ON s.transcript_id=t.id WHERE t.job_id=c.job_id AND s.text ILIKE $1) ORDER BY c.created_at DESC", [`%${query}%`])).rows.map(toCandidate) };
+    const query = (request.query as { q?: string }).q?.trim() ?? '';
+    const searchPlan = query ? await expandSearchQuery(query, {
+      apiKey: process.env.OPENAI_API_KEY,
+      model: process.env.OPENAI_SEARCH_MODEL ?? process.env.SEARCH_MODEL ?? 'gpt-4o-mini',
+      timeoutMs: Number(process.env.SEARCH_EXPANSION_TIMEOUT_MS ?? 700),
+    }) : null;
+    const rows = await loadDashboardRows(db, null, query || null, 100, searchPlan);
+    return {
+      items: rows.map(toCandidate),
+      ...(searchPlan ? { search: { ...searchPlan, resultRanks: rows.map((row) => Number(row.search_rank ?? 0)) } } : {}),
+    };
   });
 
   app.get('/v1/clips/:candidateId', async (request, reply) => {
