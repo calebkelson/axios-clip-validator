@@ -21,6 +21,18 @@ export const TranscriptSegmentSchema = z.object({ startSeconds: z.number().nonne
 export const TranscriptSchema = z.object({ id: z.string().uuid(), jobId: z.string().uuid(), status: z.enum(['processing', 'completed', 'failed']), provider: z.string().nullable(), language: z.string().nullable(), fullText: z.string().nullable(), durationSeconds: z.number().nonnegative().nullable(), segments: z.array(TranscriptSegmentSchema), error: z.string().nullable(), createdAt: z.string().datetime(), updatedAt: z.string().datetime() });
 export const HeadlineCardSchema = z.object({ id: z.string().min(1).max(80), text: z.string().max(180), startSeconds: z.number().min(0).max(60), endSeconds: z.number().min(0).max(60), color: z.enum(headlineCardColors), shape: z.enum(headlineCardShapes).default('rounded'), xPercent: z.number().min(0).max(100).default(50), yPercent: z.number().min(0).max(100).default(70), widthPercent: z.number().min(12).max(92).default(84), heightPercent: z.number().min(8).max(70).default(21), transitionSeconds: z.number().min(0.05).max(2).default(0.35), placementCustomized: z.boolean().default(false) }).refine((value) => value.endSeconds > value.startSeconds, { message: 'headline card endSeconds must be greater than startSeconds', path: ['endSeconds'] });
 export const NameTagSchema = z.object({ id: z.string().min(1).max(80), name: z.string().max(80), title: z.string().max(100), startSeconds: z.number().min(0).max(60), endSeconds: z.number().min(0).max(60), color: z.enum(headlineCardColors).default('white'), xPercent: z.number().min(0).max(100).default(32), yPercent: z.number().min(0).max(100).default(78), widthPercent: z.number().min(18).max(70).default(58), heightPercent: z.number().min(8).max(42).default(14), transitionSeconds: z.number().min(0.05).max(2).default(0.35), placementCustomized: z.boolean().default(false) }).refine((value) => value.endSeconds > value.startSeconds, { message: 'nametag endSeconds must be greater than startSeconds', path: ['endSeconds'] });
+const RenderSpecObjectSchema = z.object({}).passthrough();
+export const RenderSpecSchema = z.object({
+  schema: z.literal('axios.clip.render-spec.v1'),
+  rendererTarget: z.literal('headless_chromium'),
+  dimensions: z.object({ width: z.number().int().positive(), height: z.number().int().positive(), fps: z.number().positive().refine((value) => value === 30, { message: 'renderSpec dimensions.fps must be 30' }) }).passthrough(),
+  source: RenderSpecObjectSchema,
+  video: RenderSpecObjectSchema,
+  logo: RenderSpecObjectSchema,
+  headlineCards: z.array(RenderSpecObjectSchema),
+  nameTags: z.array(RenderSpecObjectSchema),
+  captions: z.union([RenderSpecObjectSchema, z.array(RenderSpecObjectSchema)]),
+}).passthrough();
 export const CandidateSocialCopySchema = z.object({
   headline: z.string(),
   caption: z.string(),
@@ -30,6 +42,11 @@ export const CandidateSocialCopySchema = z.object({
   optionalCta: z.string().max(240).nullable().optional(),
   headlineCards: z.array(HeadlineCardSchema).default([]),
   nameTags: z.array(NameTagSchema).default([]),
+  // The clip editor owns these opaque-but-versioned JSON values. Keeping them
+  // in the contract prevents the API's Zod parsing from silently stripping
+  // editor state before it reaches the worker.
+  transcriptEdits: z.unknown().optional(),
+  subtitlePosition: z.unknown().optional(),
 });
 export const CandidateEvidenceSchema = z.object({ startSeconds: z.number().nonnegative(), endSeconds: z.number().nonnegative(), text: z.string().min(1) });
 export const AudienceConfidenceLabelSchema = z.enum(['low', 'medium', 'high']);
@@ -127,7 +144,7 @@ export const YouTubeIngestRequestSchema = z.object({
   mode: z.enum(['whole_media', 'find_moments', 'transcribe_only']).default('find_moments'),
   dryRun: z.boolean().default(false),
 });
-export const CreateRenderSchema = z.object({ profile: z.enum(renderProfiles).default('vertical_reel'), fitMode: z.enum(renderFitModes).default('cover'), background: z.enum(renderBackgrounds).default('dark_blue'), logoPosition: z.enum(logoPositions).default('top-left'), logoAssetId: z.string().uuid().nullable().default(null), captionMode: z.enum(captionModes).default('burned'), includeLogo: z.boolean().default(true) });
-export const RenderSchema = z.object({ id: z.string().uuid(), candidateId: z.string().uuid(), profile: z.enum(renderProfiles), fitMode: z.enum(renderFitModes), background: z.enum(renderBackgrounds).default('dark_blue'), logoPosition: z.enum(logoPositions), logoAssetId: z.string().uuid().nullable(), captionMode: z.enum(captionModes), includeLogo: z.boolean(), status: z.enum(jobStates), progress: z.number().int().min(0).max(100), attempts: z.number().int().nonnegative(), error: z.string().nullable(), assetId: z.string().uuid().nullable(), captionAssetId: z.string().uuid().nullable(), thumbnailAssetId: z.string().uuid().nullable(), manifestAssetId: z.string().uuid().nullable(), renderManifest: z.record(z.unknown()).nullable(), playbackUrl: z.string().nullable(), captionsUrl: z.string().nullable(), thumbnailUrl: z.string().nullable(), manifestUrl: z.string().nullable(), createdAt: z.string().datetime(), completedAt: z.string().datetime().nullable() });
-export type CreateSource = z.infer<typeof CreateSourceSchema>; export type CreateJob = z.infer<typeof CreateJobSchema>; export type Job = z.infer<typeof JobSchema>; export type Probe = z.infer<typeof ProbeSchema>; export type Transcript = z.infer<typeof TranscriptSchema>; export type Candidate = z.infer<typeof CandidateSchema>; export type BrandAsset = z.infer<typeof BrandAssetSchema>; export type Render = z.infer<typeof RenderSchema>;
+export const CreateRenderSchema = z.object({ profile: z.enum(renderProfiles).default('vertical_reel'), fitMode: z.enum(renderFitModes).default('cover'), background: z.enum(renderBackgrounds).default('dark_blue'), logoPosition: z.enum(logoPositions).default('top-left'), logoAssetId: z.string().uuid().nullable().default(null), captionMode: z.enum(captionModes).default('burned'), includeLogo: z.boolean().default(true), renderSpec: RenderSpecSchema.optional() });
+export const RenderSchema = z.object({ id: z.string().uuid(), candidateId: z.string().uuid(), profile: z.enum(renderProfiles), fitMode: z.enum(renderFitModes), background: z.enum(renderBackgrounds).default('dark_blue'), logoPosition: z.enum(logoPositions), logoAssetId: z.string().uuid().nullable(), captionMode: z.enum(captionModes), includeLogo: z.boolean(), renderSpec: RenderSpecSchema.nullable().default(null), status: z.enum(jobStates), progress: z.number().int().min(0).max(100), attempts: z.number().int().nonnegative(), error: z.string().nullable(), assetId: z.string().uuid().nullable(), captionAssetId: z.string().uuid().nullable(), thumbnailAssetId: z.string().uuid().nullable(), manifestAssetId: z.string().uuid().nullable(), renderManifest: z.record(z.unknown()).nullable(), playbackUrl: z.string().nullable(), captionsUrl: z.string().nullable(), thumbnailUrl: z.string().nullable(), manifestUrl: z.string().nullable(), createdAt: z.string().datetime(), completedAt: z.string().datetime().nullable() });
+export type CreateSource = z.infer<typeof CreateSourceSchema>; export type CreateJob = z.infer<typeof CreateJobSchema>; export type Job = z.infer<typeof JobSchema>; export type Probe = z.infer<typeof ProbeSchema>; export type Transcript = z.infer<typeof TranscriptSchema>; export type Candidate = z.infer<typeof CandidateSchema>; export type BrandAsset = z.infer<typeof BrandAssetSchema>; export type RenderSpec = z.infer<typeof RenderSpecSchema>; export type Render = z.infer<typeof RenderSchema>;
 export const validTransition = (from: typeof jobStates[number], to: typeof jobStates[number]) => ({ queued: ['processing', 'cancelled'], processing: ['queued', 'completed', 'failed', 'cancelled'], completed: [], failed: [], cancelled: [] }[from] as string[]).includes(to);
