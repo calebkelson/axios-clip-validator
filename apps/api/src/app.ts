@@ -228,6 +228,7 @@ const dashboardSelect = `
     y.published_at AS youtube_published_at, y.upload_date AS youtube_upload_date,
     p.status AS probe_status, p.duration_seconds, p.width, p.height,
     sa.id AS source_asset_id,
+    pa.id AS preview_asset_id,
     r.id AS render_id, r.profile AS render_profile, r.fit_mode AS render_fit_mode, r.background AS render_background, r.logo_position AS render_logo_position, r.logo_asset_id AS render_logo_asset_id, r.caption_mode AS render_caption_mode,
     r.include_logo AS render_include_logo, r.status AS render_status, r.progress AS render_progress,
     r.attempts AS render_attempts, r.error AS render_error, r.asset_id AS render_asset_id,
@@ -243,6 +244,9 @@ const dashboardSelect = `
   LEFT JOIN LATERAL (
     SELECT id FROM assets WHERE source_id=j.source_id AND role='source' ORDER BY created_at DESC LIMIT 1
   ) sa ON true
+  LEFT JOIN LATERAL (
+    SELECT id FROM assets WHERE source_id=j.source_id AND role='preview' ORDER BY created_at DESC LIMIT 1
+  ) pa ON true
   LEFT JOIN LATERAL (
     SELECT * FROM clip_renders WHERE candidate_id=c.id ORDER BY created_at DESC LIMIT 1
   ) r ON true
@@ -296,6 +300,8 @@ const toDashboardClip = (row: Record<string, any>) => {
       uri: row.source_uri,
       metadata: row.source_metadata ?? {},
       assetUrl: row.source_asset_id ? `/v1/assets/${row.source_asset_id}` : null,
+      previewAssetId: row.preview_asset_id ?? null,
+      previewAssetUrl: row.preview_asset_id ? `/v1/assets/${row.preview_asset_id}` : null,
       durationSeconds: row.duration_seconds === null ? null : Number(row.duration_seconds),
       width: row.width ?? null,
       height: row.height ?? null,

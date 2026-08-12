@@ -8,8 +8,10 @@ import pg from 'pg';
 import { AssetStore } from '@clipper/storage';
 import { CandidateProposal, EditorialCandidateProvider, createEditorialCandidateProvider } from './candidates.js';
 import { createPlatformSourceAdapter, PlatformSourceAdapter } from './source-adapters.js';
+import { PlaybackPreviewGenerator } from './playback-preview.js';
 export { RenderProcessor, buildAss, buildSrt, formatSrtTime, renderProfiles } from './rendering.js';
 export { createPlatformSourceAdapter, PlatformSourceAdapter, YtDlpSourceAdapter } from './source-adapters.js';
+export { PlaybackPreviewGenerator, buildPlaybackPreviewArgs } from './playback-preview.js';
 export * from './audience-signals/index.js';
 
 const execFile = promisify(execFileCallback);
@@ -191,18 +193,20 @@ export class MediaProcessor {
   private readonly candidateProvider: EditorialCandidateProvider;
   private readonly ffprobeBinary: string;
   private readonly maxSourceBytes: number;
+  private readonly playbackPreview: PlaybackPreviewGenerator | null;
 
   constructor(
     private readonly db: pg.Pool,
     private readonly store: AssetStore,
     private readonly leaseSeconds = 60,
-    options: { transcriber?: TranscriptionProvider; candidateProvider?: EditorialCandidateProvider; ffprobeBinary?: string; maxSourceBytes?: number; platformSourceAdapter?: PlatformSourceAdapter | null } = {},
+    options: { transcriber?: TranscriptionProvider; candidateProvider?: EditorialCandidateProvider; ffprobeBinary?: string; maxSourceBytes?: number; platformSourceAdapter?: PlatformSourceAdapter | null; playbackPreview?: PlaybackPreviewGenerator | null } = {},
   ) {
     this.transcriber = options.transcriber ?? createTranscriptionProvider();
     this.candidateProvider = options.candidateProvider ?? createEditorialCandidateProvider();
     this.ffprobeBinary = options.ffprobeBinary ?? process.env.FFPROBE_BIN ?? 'ffprobe';
     this.maxSourceBytes = options.maxSourceBytes ?? Number(process.env.MAX_SOURCE_BYTES ?? 5_000_000_000);
     this.platformSourceAdapter = options.platformSourceAdapter === undefined ? createPlatformSourceAdapter() : options.platformSourceAdapter;
+    this.playbackPreview = options.playbackPreview === undefined && process.env.PLAYBACK_PREVIEW_ENABLED !== 'false' ? new PlaybackPreviewGenerator(db, store) : options.playbackPreview ?? null;
   }
 
   private readonly platformSourceAdapter: PlatformSourceAdapter | null;
@@ -238,6 +242,17 @@ export class MediaProcessor {
         sourceAssetId: sourceAsset.assetId,
         probe: { sourceId: source.id, durationSeconds: probe.durationSeconds, width: probe.width, height: probe.height },
       };
+      if (this.playbackPreview && source.media_type === 'video') {
+        try {
+          const preview = await this.playbackPreview.ensure(source.id, sourceAsset.storageKey, join(process.env.TMPDIR ?? '/tmp', 'clipper-preview-jobs', job.id));
+          result.playbackPreview = preview;
+          console.log(JSON.stringify({ event: 'playback_preview', jobId: job.id, sourceId: source.id, status: preview.status, assetId: preview.assetId, storageKey: preview.storageKey }));
+        } catch (error) {
+          const message = error instanceof Error ? error.message : 'playback preview failed';
+          result.playbackPreview = { status: 'failed', error: message };
+          console.warn(JSON.stringify({ event: 'playback_preview_failed', jobId: job.id, sourceId: source.id, error: message }));
+        }
+      }
       if (job.mode === 'transcribe_only' || job.mode === 'find_moments') {
         if (youtubeSourceId) await this.updateYouTubeIngestion(youtubeSourceId, 'processing');
         const transcript = await this.transcribe(job.id, source.id, sourcePath, probe.durationSeconds);
