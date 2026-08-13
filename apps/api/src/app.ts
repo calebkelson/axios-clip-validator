@@ -232,27 +232,10 @@ const searchCaptionSql = "lower(concat_ws(' ', COALESCE(c.social_copy->>'caption
 const searchEvidenceSql = "lower(concat_ws(' ', COALESCE(c.evidence::text,''), COALESCE(c.metadata::text,'')))";
 const searchAllTextSql = `lower(concat_ws(' ', ${searchHeadlineSql}, ${searchSourceSql}, ${searchCaptionSql}, ${searchEvidenceSql}))`;
 
-function transcriptSearchSql(termExpression: string) {
-  return `EXISTS (
-    SELECT 1
-    FROM transcripts t
-    WHERE t.job_id=c.job_id
-      AND (
-        lower(COALESCE(t.full_text,'')) LIKE '%' || lower(${termExpression}) || '%'
-        OR EXISTS (
-          SELECT 1
-          FROM transcript_segments ts
-          WHERE ts.transcript_id=t.id
-            AND lower(ts.text) LIKE '%' || lower(${termExpression}) || '%'
-        )
-      )
-  ) `;
-}
-
 function dashboardSearchPredicate() {
   return `($4::text IS NULL OR (
     ${searchAllTextSql} LIKE '%' || lower($4) || '%'
-    OR ${transcriptSearchSql('$4')}
+    OR tm.job_id IS NOT NULL
     OR EXISTS (SELECT 1 FROM unnest($5::text[]) AS exact_term(value) WHERE ${searchAllTextSql} LIKE '%' || lower(exact_term.value) || '%')
     OR EXISTS (SELECT 1 FROM unnest($6::text[]) AS related_term(value) WHERE ${searchAllTextSql} LIKE '%' || lower(related_term.value) || '%')
   ))`;
@@ -264,7 +247,7 @@ function dashboardSearchRank() {
     + (CASE WHEN ${searchSourceSql} LIKE '%' || lower($4) || '%' THEN 80 ELSE 0 END)
     + (CASE WHEN ${searchCaptionSql} LIKE '%' || lower($4) || '%' THEN 45 ELSE 0 END)
     + (CASE WHEN ${searchEvidenceSql} LIKE '%' || lower($4) || '%' THEN 35 ELSE 0 END)
-    + (CASE WHEN ${transcriptSearchSql('$4')} THEN 60 ELSE 0 END)
+    + COALESCE(tm.transcript_rank, 0)
     + (SELECT COUNT(*) * 8 FROM unnest($5::text[]) AS exact_term(value) WHERE ${searchHeadlineSql} LIKE '%' || lower(exact_term.value) || '%')
     + (SELECT COUNT(*) * 6 FROM unnest($5::text[]) AS exact_term(value) WHERE ${searchSourceSql} LIKE '%' || lower(exact_term.value) || '%')
     + (SELECT COUNT(*) * 4 FROM unnest($5::text[]) AS exact_term(value) WHERE ${searchCaptionSql} LIKE '%' || lower(exact_term.value) || '%')
@@ -276,6 +259,16 @@ function dashboardSearchRank() {
 
 function dashboardSelect(smartSearch = false) {
   return `
+  ${smartSearch ? `WITH transcript_matches AS (
+    SELECT t.job_id, 60::numeric AS transcript_rank
+    FROM transcripts t
+    WHERE lower(COALESCE(t.full_text, '')) LIKE '%' || lower($4::text) || '%'
+    UNION
+    SELECT t.job_id, 60::numeric AS transcript_rank
+    FROM transcripts t
+    JOIN transcript_segments ts ON ts.transcript_id=t.id
+    WHERE lower(ts.text) LIKE '%' || lower($4::text) || '%'
+  )` : ''}
   SELECT c.*, j.source_id, j.status AS job_status, j.progress AS job_progress, j.last_error AS job_error,
     s.source_type, s.media_type, s.uri AS source_uri, s.metadata AS source_metadata,
     y.published_at AS youtube_published_at, y.upload_date AS youtube_upload_date,
@@ -310,6 +303,7 @@ function dashboardSelect(smartSearch = false) {
     ORDER BY s.collected_at DESC
     LIMIT 1
   ) audience ON true
+  ${smartSearch ? 'LEFT JOIN transcript_matches tm ON tm.job_id=c.job_id' : ''}
   WHERE ($1::uuid IS NULL OR c.id=$1)
     AND ${smartSearch ? `${dashboardSearchPredicate()}
       AND $2::text IS NULL` : `($2::text IS NULL OR c.metadata::text ILIKE $2 OR c.social_copy::text ILIKE $2 OR s.metadata::text ILIKE $2 OR s.uri ILIKE $2
