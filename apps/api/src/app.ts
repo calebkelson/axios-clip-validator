@@ -732,11 +732,11 @@ export function buildApp(db: pg.Pool, store: AssetStore, maxUploadBytes = 5_000_
     const source = query.source === 'youtube' || query.source === 'non_youtube' ? query.source : null;
     const audience = query.audience?.split(',').map((value) => value.trim()).filter(Boolean).slice(0, 20) ?? [];
     const responseSearchPlan = searchText ? fallbackSearchPlan(searchText) : null;
-    const queueOptions = {
+    const queueOptions: DashboardQueueOptions = {
       offset,
       sort: query.sort === 'oldest' ? 'oldest' as const : 'newest' as const,
-      stage,
-      source,
+      stage: stage as DashboardQueueOptions['stage'],
+      source: source as DashboardQueueOptions['source'],
       youtubeVideoId: query.youtubeVideoId ?? null,
       audience,
     };
