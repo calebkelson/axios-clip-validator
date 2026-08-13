@@ -731,11 +731,7 @@ export function buildApp(db: pg.Pool, store: AssetStore, maxUploadBytes = 5_000_
     const stage = query.stage === 'review' || query.stage === 'rendering' || query.stage === 'ready' || query.stage === 'posted' ? query.stage : 'all';
     const source = query.source === 'youtube' || query.source === 'non_youtube' ? query.source : null;
     const audience = query.audience?.split(',').map((value) => value.trim()).filter(Boolean).slice(0, 20) ?? [];
-    const searchPlan = searchText ? await expandSearchQuery(searchText, {
-      apiKey: process.env.OPENAI_API_KEY,
-      model: process.env.OPENAI_SEARCH_MODEL ?? process.env.SEARCH_MODEL ?? 'gpt-4o-mini',
-      timeoutMs: Number(process.env.SEARCH_EXPANSION_TIMEOUT_MS ?? 700),
-    }) : null;
+    const responseSearchPlan = searchText ? fallbackSearchPlan(searchText) : null;
     const queueOptions = {
       offset,
       sort: query.sort === 'oldest' ? 'oldest' as const : 'newest' as const,
@@ -744,15 +740,10 @@ export function buildApp(db: pg.Pool, store: AssetStore, maxUploadBytes = 5_000_
       youtubeVideoId: query.youtubeVideoId ?? null,
       audience,
     };
-    let rows;
-    let responseSearchPlan = searchPlan;
-    try {
-      rows = await loadDashboardRows(db, null, searchText || null, limit, searchPlan, queueOptions);
-    } catch (error) {
-      request.log.warn({ err: error }, 'smart dashboard search failed; using fallback matcher');
-      responseSearchPlan = searchText ? fallbackSearchPlan(searchText) : null;
-      rows = await loadDashboardRows(db, null, searchText || null, limit, null, queueOptions);
-    }
+    // Keep the queue path deterministic and database-only. The experimental
+    // model-ranked SQL search can be reintroduced behind a feature flag after
+    // it has been validated against every Render schema.
+    const rows = await loadDashboardRows(db, null, searchText || null, limit, null, queueOptions);
     const totalCount = rows.length ? Number(rows[0].total_count) : null;
     return {
       items: rows.map(toDashboardClip),
@@ -780,15 +771,8 @@ export function buildApp(db: pg.Pool, store: AssetStore, maxUploadBytes = 5_000_
       model: process.env.OPENAI_SEARCH_MODEL ?? process.env.SEARCH_MODEL ?? 'gpt-4o-mini',
       timeoutMs: Number(process.env.SEARCH_EXPANSION_TIMEOUT_MS ?? 700),
     }) : null;
-    let rows;
-    let responseSearchPlan = searchPlan;
-    try {
-      rows = await loadDashboardRows(db, null, query || null, 100, searchPlan);
-    } catch (error) {
-      request.log.warn({ err: error }, 'smart clip search failed; using fallback matcher');
-      responseSearchPlan = query ? fallbackSearchPlan(query) : null;
-      rows = await loadDashboardRows(db, null, query || null, 100, null);
-    }
+    const responseSearchPlan = query ? fallbackSearchPlan(query) : null;
+    const rows = await loadDashboardRows(db, null, query || null, 100, null);
     return {
       items: rows.map(toCandidate),
       ...(responseSearchPlan ? { search: { ...responseSearchPlan, resultRanks: rows.map((row) => Number(row.search_rank ?? 0)) } } : {}),
