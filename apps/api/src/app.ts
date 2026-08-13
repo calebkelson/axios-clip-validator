@@ -285,7 +285,8 @@ function dashboardSelect(smartSearch = false, options: { offsetParam: number; so
     r.caption_asset_id AS render_caption_asset_id, r.thumbnail_asset_id AS render_thumbnail_asset_id,
     r.manifest_asset_id AS render_manifest_asset_id, r.render_manifest, r.created_at AS render_created_at,
     r.completed_at AS render_completed_at,
-    audience.signal AS audience_signal${smartSearch ? `, ${dashboardSearchRank()}` : ''}
+    audience.signal AS audience_signal,
+    audience.classifications AS audience_classifications${smartSearch ? `, ${dashboardSearchRank()}` : ''}
   FROM clip_candidates c
   JOIN processing_jobs j ON j.id=c.job_id
   JOIN media_sources s ON s.id=j.source_id
@@ -301,7 +302,7 @@ function dashboardSelect(smartSearch = false, options: { offsetParam: number; so
     SELECT * FROM clip_renders WHERE candidate_id=c.id ORDER BY created_at DESC LIMIT 1
   ) r ON true
   LEFT JOIN LATERAL (
-    SELECT s.signal
+    SELECT s.signal, s.classifications
     FROM youtube_audience_clip_snapshots s
     WHERE s.candidate_id=c.id
     ORDER BY s.collected_at DESC
@@ -337,7 +338,7 @@ async function loadDashboardRows(db: pg.Pool, candidateId: string | null, query:
   if (options.source === 'youtube') addFilter('y.youtube_video_id IS NOT NULL');
   if (options.source === 'non_youtube') addFilter('y.youtube_video_id IS NULL');
   if (options.youtubeVideoId?.trim()) addFilter('y.youtube_video_id = $FILTER', options.youtubeVideoId.trim());
-  if (options.audience?.length) addFilter("(jsonb_build_array(COALESCE(audience.signal->>'primaryClassification', '')) || COALESCE(audience.signal->'classifications', '[]'::jsonb)) ?| $FILTER::text[]", options.audience);
+  if (options.audience?.length) addFilter("(jsonb_build_array(COALESCE(audience.signal->>'primaryClassification', '')) || COALESCE(audience.signal->'classifications', '[]'::jsonb) || COALESCE(audience.classifications, '[]'::jsonb)) ?| $FILTER::text[]", options.audience);
   if (options.stage === 'posted') addFilter('c.posted = true');
   if (options.stage === 'rendering') addFilter("r.status IN ('queued', 'processing')");
   if (options.stage === 'ready') addFilter("r.status = 'completed' AND c.posted = false");
