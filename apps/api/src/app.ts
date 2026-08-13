@@ -56,6 +56,7 @@ const toTranscript = (row: Record<string, any>, segments: Record<string, any>[])
 
 const toCandidate = (row: Record<string, any>) => {
   const copy = row.social_copy && typeof row.social_copy === 'object' ? row.social_copy : {};
+  const textWithin = (value: unknown, max: number) => typeof value === 'string' ? value.slice(0, max) : '';
   const audienceSignal = row.audience_signal && typeof row.audience_signal === 'object' ? AudienceSignalSchema.parse(row.audience_signal) : null;
   return CandidateSchema.parse({
     id: row.id,
@@ -72,9 +73,15 @@ const toCandidate = (row: Record<string, any>) => {
       headline: typeof copy.headline === 'string' ? copy.headline : '',
       caption: typeof copy.caption === 'string' ? copy.caption : '',
       hashtags: Array.isArray(copy.hashtags) ? copy.hashtags : [],
-      ...(typeof copy.hook === 'string' ? { hook: copy.hook } : {}),
-      ...(copy.alternates && typeof copy.alternates === 'object' ? { alternates: copy.alternates } : {}),
-      ...(copy.optionalCta === null || typeof copy.optionalCta === 'string' ? { optionalCta: copy.optionalCta } : {}),
+      ...(typeof copy.hook === 'string' ? { hook: textWithin(copy.hook, 125) } : {}),
+      ...(copy.alternates && typeof copy.alternates === 'object' ? {
+        alternates: {
+          curiosity: textWithin((copy.alternates as Record<string, unknown>).curiosity, 480),
+          stakes: textWithin((copy.alternates as Record<string, unknown>).stakes, 480),
+          conversation: textWithin((copy.alternates as Record<string, unknown>).conversation, 480),
+        },
+      } : {}),
+      ...(copy.optionalCta === null || typeof copy.optionalCta === 'string' ? { optionalCta: copy.optionalCta === null ? null : textWithin(copy.optionalCta, 240) } : {}),
       headlineCards: Array.isArray(copy.headlineCards) ? copy.headlineCards : [],
       nameTags: Array.isArray(copy.nameTags) ? copy.nameTags : [],
       ...(copy.transcriptEdits !== undefined ? { transcriptEdits: copy.transcriptEdits } : {}),
