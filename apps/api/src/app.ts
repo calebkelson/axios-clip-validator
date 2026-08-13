@@ -233,11 +233,24 @@ const searchEvidenceSql = "lower(concat_ws(' ', COALESCE(c.evidence::text,''), C
 const searchAllTextSql = `lower(concat_ws(' ', ${searchHeadlineSql}, ${searchSourceSql}, ${searchCaptionSql}, ${searchEvidenceSql}))`;
 
 function dashboardSearchPredicate() {
-  return `sm.id IS NOT NULL`;
+  return `(
+    ${searchAllTextSql} LIKE '%' || lower($4::text) || '%'
+    OR ${searchAllTextSql} LIKE ANY (SELECT '%' || lower(value) || '%' FROM unnest($5::text[]) AS exact_term(value))
+    OR ${searchAllTextSql} LIKE ANY (SELECT '%' || lower(value) || '%' FROM unnest($6::text[]) AS related_term(value))
+    OR EXISTS (SELECT 1 FROM transcripts t WHERE t.job_id=c.job_id AND lower(COALESCE(t.full_text, '')) LIKE '%' || lower($4::text) || '%')
+    OR EXISTS (SELECT 1 FROM transcripts t JOIN transcript_segments ts ON ts.transcript_id=t.id WHERE t.job_id=c.job_id AND lower(ts.text) LIKE '%' || lower($4::text) || '%')
+  )`;
 }
 
 function dashboardSearchRank() {
-  return `sm.search_rank AS search_rank`;
+  return `(
+    CASE WHEN ${searchHeadlineSql} LIKE '%' || lower($4::text) || '%' THEN 100 ELSE 0 END
+    + CASE WHEN ${searchSourceSql} LIKE '%' || lower($4::text) || '%' THEN 80 ELSE 0 END
+    + CASE WHEN ${searchCaptionSql} LIKE '%' || lower($4::text) || '%' THEN 45 ELSE 0 END
+    + CASE WHEN ${searchEvidenceSql} LIKE '%' || lower($4::text) || '%' THEN 35 ELSE 0 END
+    + CASE WHEN EXISTS (SELECT 1 FROM transcripts t WHERE t.job_id=c.job_id AND lower(COALESCE(t.full_text, '')) LIKE '%' || lower($4::text) || '%') THEN 60 ELSE 0 END
+    + COALESCE(c.confidence, 0) * 5
+  ) AS search_rank`;
 }
 
 type DashboardQueueOptions = {
