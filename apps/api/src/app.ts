@@ -240,66 +240,20 @@ function dashboardSearchRank() {
   return `sm.search_rank AS search_rank`;
 }
 
-function dashboardSelect(smartSearch = false) {
+type DashboardQueueOptions = {
+  offset?: number;
+  sort?: 'newest' | 'oldest';
+  stage?: 'all' | 'review' | 'rendering' | 'ready' | 'posted';
+  source?: 'youtube' | 'non_youtube' | null;
+  youtubeVideoId?: string | null;
+  audience?: string[];
+};
+
+function dashboardSelect(smartSearch = false, options: { offsetParam: number; sort: 'newest' | 'oldest'; filters: string[] }) {
+  const dateOrder = options.sort === 'oldest' ? 'ASC' : 'DESC';
+  const filters = options.filters.length ? `\n    AND ${options.filters.join('\n    AND ')}` : '';
   return `
-  ${smartSearch ? `WITH transcript_matches AS (
-    SELECT t.job_id, 60::numeric AS transcript_rank
-    FROM transcripts t
-    WHERE lower(COALESCE(t.full_text, '')) LIKE '%' || lower($4::text) || '%'
-    UNION
-    SELECT t.job_id, 60::numeric AS transcript_rank
-    FROM transcripts t
-    JOIN transcript_segments ts ON ts.transcript_id=t.id
-    WHERE lower(ts.text) LIKE '%' || lower($4::text) || '%'
-  ), candidate_text AS MATERIALIZED (
-    SELECT c.id, c.job_id, c.confidence, tm.transcript_rank,
-      ${searchHeadlineSql} AS headline_text,
-      ${searchSourceSql} AS source_text,
-      ${searchCaptionSql} AS caption_text,
-      ${searchEvidenceSql} AS evidence_text,
-      ${searchAllTextSql} AS all_text
-    FROM clip_candidates c
-    JOIN processing_jobs j ON j.id=c.job_id
-    JOIN media_sources s ON s.id=j.source_id
-    LEFT JOIN youtube_videos y ON y.media_source_id=j.source_id
-    LEFT JOIN transcript_matches tm ON tm.job_id=c.job_id
-    WHERE ($1::uuid IS NULL OR c.id=$1) AND $2::text IS NULL
-  ), matched_candidates AS MATERIALIZED (
-    SELECT *
-    FROM candidate_text mc
-    WHERE mc.all_text LIKE '%' || lower($4::text) || '%'
-      OR mc.transcript_rank IS NOT NULL
-      OR mc.all_text LIKE ANY (SELECT '%' || lower(value) || '%' FROM unnest($5::text[]) AS exact_term(value))
-      OR mc.all_text LIKE ANY (SELECT '%' || lower(value) || '%' FROM unnest($6::text[]) AS related_term(value))
-  ), search_matches AS MATERIALIZED (
-    SELECT mc.id,
-      COALESCE(score.search_rank, 0) + COALESCE(mc.transcript_rank, 0) + (COALESCE(mc.confidence, 0) * 5) AS search_rank
-    FROM matched_candidates mc
-    LEFT JOIN LATERAL (
-      SELECT SUM(
-        CASE WHEN search_term.kind = 'direct' THEN
-          (CASE WHEN mc.headline_text LIKE '%' || search_term.term || '%' THEN 100 ELSE 0 END)
-          + (CASE WHEN mc.source_text LIKE '%' || search_term.term || '%' THEN 80 ELSE 0 END)
-          + (CASE WHEN mc.caption_text LIKE '%' || search_term.term || '%' THEN 45 ELSE 0 END)
-          + (CASE WHEN mc.evidence_text LIKE '%' || search_term.term || '%' THEN 35 ELSE 0 END)
-        WHEN search_term.kind = 'exact' THEN
-          (CASE WHEN mc.headline_text LIKE '%' || search_term.term || '%' THEN 8 ELSE 0 END)
-          + (CASE WHEN mc.source_text LIKE '%' || search_term.term || '%' THEN 6 ELSE 0 END)
-          + (CASE WHEN mc.caption_text LIKE '%' || search_term.term || '%' THEN 4 ELSE 0 END)
-          + (CASE WHEN mc.evidence_text LIKE '%' || search_term.term || '%' THEN 3 ELSE 0 END)
-        ELSE 3 END
-      ) AS search_rank
-      FROM (
-        SELECT lower($4::text) AS term, 'direct' AS kind
-        UNION ALL
-        SELECT lower(value), 'exact' FROM unnest($5::text[]) AS exact_term(value)
-        UNION ALL
-        SELECT lower(value), 'related' FROM unnest($6::text[]) AS related_term(value)
-      ) search_term
-      WHERE mc.all_text LIKE '%' || search_term.term || '%'
-    ) score ON true
-  )` : ''}
-  SELECT c.*, j.source_id, j.status AS job_status, j.progress AS job_progress, j.last_error AS job_error,
+  SELECT c.*, COUNT(*) OVER() AS total_count, j.source_id, j.status AS job_status, j.progress AS job_progress, j.last_error AS job_error,
     s.source_type, s.media_type, s.uri AS source_uri, s.metadata AS source_metadata,
     y.published_at AS youtube_published_at, y.upload_date AS youtube_upload_date,
     p.status AS probe_status, p.duration_seconds, p.width, p.height,
@@ -333,22 +287,47 @@ function dashboardSelect(smartSearch = false) {
     ORDER BY s.collected_at DESC
     LIMIT 1
   ) audience ON true
-  ${smartSearch ? 'JOIN search_matches sm ON sm.id=c.id' : ''}
   WHERE ($1::uuid IS NULL OR c.id=$1)
     AND ${smartSearch ? `${dashboardSearchPredicate()}
       AND $2::text IS NULL` : `($2::text IS NULL OR c.metadata::text ILIKE $2 OR c.social_copy::text ILIKE $2 OR s.metadata::text ILIKE $2 OR s.uri ILIKE $2
       OR EXISTS (SELECT 1 FROM transcripts t WHERE t.job_id=c.job_id AND t.full_text ILIKE $2)
-      OR EXISTS (SELECT 1 FROM transcripts t JOIN transcript_segments ts ON ts.transcript_id=t.id WHERE t.job_id=c.job_id AND ts.text ILIKE $2))`}
-  ORDER BY ${smartSearch ? 'search_rank DESC, ' : ''}y.published_at DESC NULLS LAST, y.upload_date DESC NULLS LAST, c.created_at DESC
-  LIMIT $3`;
+      OR EXISTS (SELECT 1 FROM transcripts t JOIN transcript_segments ts ON ts.transcript_id=t.id WHERE t.job_id=c.job_id AND ts.text ILIKE $2))`}${filters}
+  ORDER BY ${smartSearch ? 'search_rank DESC, ' : ''}COALESCE(y.published_at, c.created_at) ${dateOrder}, c.created_at ${dateOrder}, c.id ${dateOrder}
+  LIMIT $3 OFFSET $${options.offsetParam}`;
 }
 
-async function loadDashboardRows(db: pg.Pool, candidateId: string | null, query: string | null, limit: number, searchPlan: SearchPlan | null = null) {
+async function loadDashboardRows(db: pg.Pool, candidateId: string | null, query: string | null, limit: number, searchPlan: SearchPlan | null = null, options: DashboardQueueOptions = {}) {
   const smartSearch = Boolean(searchPlan);
+  const offset = Math.max(Number(options.offset ?? 0) || 0, 0);
+  const sort = options.sort === 'oldest' ? 'oldest' : 'newest';
   const params: unknown[] = smartSearch && searchPlan
-    ? [candidateId, null, limit, searchPlan.exactPhrase, searchPlan.exactTerms, searchPlan.relatedTerms]
-    : [candidateId, query ? `%${query}%` : null, limit];
-  return (await db.query(dashboardSelect(smartSearch), params)).rows;
+    ? [candidateId, null, limit, searchPlan.exactPhrase, searchPlan.exactTerms, searchPlan.relatedTerms, offset]
+    : [candidateId, query ? `%${query}%` : null, limit, offset];
+  const filters: string[] = [];
+  let nextFilterParam = smartSearch ? 8 : 5;
+  const addFilter = (sql: string, value?: unknown) => {
+    if (value === undefined) filters.push(sql);
+    else {
+      filters.push(sql.replace('$FILTER', `$${nextFilterParam}`));
+      params.push(value);
+      nextFilterParam += 1;
+    }
+  };
+
+  if (options.source === 'youtube') addFilter('y.youtube_video_id IS NOT NULL');
+  if (options.source === 'non_youtube') addFilter('y.youtube_video_id IS NULL');
+  if (options.youtubeVideoId?.trim()) addFilter('y.youtube_video_id = $FILTER', options.youtubeVideoId.trim());
+  if (options.audience?.length) addFilter("(jsonb_build_array(COALESCE(audience.signal->>'primaryClassification', '')) || COALESCE(audience.signal->'classifications', '[]'::jsonb)) ?| $FILTER::text[]", options.audience);
+  if (options.stage === 'posted') addFilter('c.posted = true');
+  if (options.stage === 'rendering') addFilter("r.status IN ('queued', 'processing')");
+  if (options.stage === 'ready') addFilter("r.status = 'completed' AND c.posted = false");
+  if (options.stage === 'review') addFilter("c.posted = false AND c.review_status IN ('proposed', 'edited') AND (r.status IS NULL OR r.status NOT IN ('queued', 'processing', 'completed'))");
+
+  return (await db.query(dashboardSelect(smartSearch, {
+    offsetParam: smartSearch ? 7 : 4,
+    sort,
+    filters,
+  }), params)).rows;
 }
 
 const toDashboardClip = (row: Record<string, any>) => {
@@ -732,17 +711,33 @@ export function buildApp(db: pg.Pool, store: AssetStore, maxUploadBytes = 5_000_
   });
 
   app.get('/v1/dashboard/queue', async (request) => {
-    const query = request.query as { q?: string; limit?: string };
+    const query = request.query as { q?: string; limit?: string; offset?: string; sort?: string; stage?: string; source?: string; youtubeVideoId?: string; audience?: string };
     const searchText = query.q?.trim() || '';
     const limit = Math.min(Math.max(Number(query.limit ?? 50) || 50, 1), 100);
+    const offset = Math.max(Number(query.offset ?? 0) || 0, 0);
+    const stage = query.stage === 'review' || query.stage === 'rendering' || query.stage === 'ready' || query.stage === 'posted' ? query.stage : 'all';
+    const source = query.source === 'youtube' || query.source === 'non_youtube' ? query.source : null;
+    const audience = query.audience?.split(',').map((value) => value.trim()).filter(Boolean).slice(0, 20) ?? [];
     const searchPlan = searchText ? await expandSearchQuery(searchText, {
       apiKey: process.env.OPENAI_API_KEY,
       model: process.env.OPENAI_SEARCH_MODEL ?? process.env.SEARCH_MODEL ?? 'gpt-4o-mini',
       timeoutMs: Number(process.env.SEARCH_EXPANSION_TIMEOUT_MS ?? 700),
     }) : null;
-    const rows = await loadDashboardRows(db, null, searchText || null, limit, searchPlan);
+    const rows = await loadDashboardRows(db, null, searchText || null, limit, searchPlan, {
+      offset,
+      sort: query.sort === 'oldest' ? 'oldest' : 'newest',
+      stage,
+      source,
+      youtubeVideoId: query.youtubeVideoId ?? null,
+      audience,
+    });
+    const totalCount = rows.length ? Number(rows[0].total_count) : null;
     return {
       items: rows.map(toDashboardClip),
+      totalCount: Number.isFinite(totalCount) ? totalCount : null,
+      offset,
+      limit,
+      hasNextPage: totalCount === null ? rows.length === limit : offset + rows.length < totalCount,
       ...(searchPlan ? { search: { ...searchPlan, resultRanks: rows.map((row) => Number(row.search_rank ?? 0)) } } : {}),
     };
   });
