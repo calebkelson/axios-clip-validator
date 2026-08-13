@@ -7,7 +7,7 @@ import { AssetStore } from '@clipper/storage';
 import { ZodError } from 'zod';
 import { YouTubeCatalogSync, YouTubeDataApiClient, YouTubeSyncError } from './youtube-sync.js';
 import { YouTubeIngestionService } from './youtube-ingestion.js';
-import { expandSearchQuery, type SearchPlan } from './search.js';
+import { expandSearchQuery, fallbackSearchPlan, type SearchPlan } from './search.js';
 
 const toJob = (row: Record<string, any>) => JobSchema.parse({
   id: row.id,
@@ -723,14 +723,23 @@ export function buildApp(db: pg.Pool, store: AssetStore, maxUploadBytes = 5_000_
       model: process.env.OPENAI_SEARCH_MODEL ?? process.env.SEARCH_MODEL ?? 'gpt-4o-mini',
       timeoutMs: Number(process.env.SEARCH_EXPANSION_TIMEOUT_MS ?? 700),
     }) : null;
-    const rows = await loadDashboardRows(db, null, searchText || null, limit, searchPlan, {
+    const queueOptions = {
       offset,
-      sort: query.sort === 'oldest' ? 'oldest' : 'newest',
+      sort: query.sort === 'oldest' ? 'oldest' as const : 'newest' as const,
       stage,
       source,
       youtubeVideoId: query.youtubeVideoId ?? null,
       audience,
-    });
+    };
+    let rows;
+    let responseSearchPlan = searchPlan;
+    try {
+      rows = await loadDashboardRows(db, null, searchText || null, limit, searchPlan, queueOptions);
+    } catch (error) {
+      request.log.warn({ err: error }, 'smart dashboard search failed; using fallback matcher');
+      responseSearchPlan = searchText ? fallbackSearchPlan(searchText) : null;
+      rows = await loadDashboardRows(db, null, searchText || null, limit, null, queueOptions);
+    }
     const totalCount = rows.length ? Number(rows[0].total_count) : null;
     return {
       items: rows.map(toDashboardClip),
@@ -738,7 +747,7 @@ export function buildApp(db: pg.Pool, store: AssetStore, maxUploadBytes = 5_000_
       offset,
       limit,
       hasNextPage: totalCount === null ? rows.length === limit : offset + rows.length < totalCount,
-      ...(searchPlan ? { search: { ...searchPlan, resultRanks: rows.map((row) => Number(row.search_rank ?? 0)) } } : {}),
+      ...(responseSearchPlan ? { search: { ...responseSearchPlan, resultRanks: rows.map((row) => Number(row.search_rank ?? 0)) } } : {}),
     };
   });
 
@@ -758,10 +767,18 @@ export function buildApp(db: pg.Pool, store: AssetStore, maxUploadBytes = 5_000_
       model: process.env.OPENAI_SEARCH_MODEL ?? process.env.SEARCH_MODEL ?? 'gpt-4o-mini',
       timeoutMs: Number(process.env.SEARCH_EXPANSION_TIMEOUT_MS ?? 700),
     }) : null;
-    const rows = await loadDashboardRows(db, null, query || null, 100, searchPlan);
+    let rows;
+    let responseSearchPlan = searchPlan;
+    try {
+      rows = await loadDashboardRows(db, null, query || null, 100, searchPlan);
+    } catch (error) {
+      request.log.warn({ err: error }, 'smart clip search failed; using fallback matcher');
+      responseSearchPlan = query ? fallbackSearchPlan(query) : null;
+      rows = await loadDashboardRows(db, null, query || null, 100, null);
+    }
     return {
       items: rows.map(toCandidate),
-      ...(searchPlan ? { search: { ...searchPlan, resultRanks: rows.map((row) => Number(row.search_rank ?? 0)) } } : {}),
+      ...(responseSearchPlan ? { search: { ...responseSearchPlan, resultRanks: rows.map((row) => Number(row.search_rank ?? 0)) } } : {}),
     };
   });
 
