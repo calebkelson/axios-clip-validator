@@ -10,6 +10,10 @@ if (!token) throw new Error('Set TRENDS_INGEST_TOKEN for authenticated publishin
 
 const raw = await readFile(filePath, 'utf8');
 const payload = JSON.parse(raw) as Record<string, unknown>;
+if (payload.skipPublish === true) {
+  console.log(JSON.stringify({ skipped: true, reason: payload.reason ?? 'collector requested no-op' }));
+  process.exit(0);
+}
 const response = await fetch(new URL('/v1/trending/snapshots', apiUrl), {
   method: 'POST',
   headers: {
