@@ -15,7 +15,9 @@
     "db:import-retention": "tsx scripts/import-youtube-retention.ts",
     "assets:migrate-r2": "tsx scripts/migrate-assets-to-r2.ts",
     "playback-previews:backfill": "tsx scripts/backfill-playback-previews.ts",
+    "trends:collect": "tsx scripts/collect-trending-topics.ts",
     "trends:publish": "tsx scripts/publish-trending-topics.ts",
+    "trends:test": "tsx --test scripts/trending.test.ts",
     "captions:rewrite": "tsx scripts/rewrite-captions.ts",
     "captions:rewrite:model": "tsx scripts/rewrite-captions.ts --model",
     "titles:rewrite:model": "tsx scripts/rewrite-captions.ts --model --titles"
