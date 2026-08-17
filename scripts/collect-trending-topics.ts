@@ -19,18 +19,6 @@ async function fetchJson<T>(url: URL, init?: RequestInit): Promise<T> {
   return JSON.parse(body) as T;
 }
 
-async function fetchYouTubePopularCategory(categoryId: string): Promise<YouTubeVideo[]> {
-  const url = new URL('https://www.googleapis.com/youtube/v3/videos');
-  url.searchParams.set('part', 'snippet,statistics');
-  url.searchParams.set('chart', 'mostPopular');
-  url.searchParams.set('regionCode', region);
-  url.searchParams.set('videoCategoryId', categoryId);
-  url.searchParams.set('maxResults', '50');
-  url.searchParams.set('key', youtubeKey as string);
-  const payload = await fetchJson<{ items?: YouTubeVideo[] }>(url);
-  return payload.items ?? [];
-}
-
 async function fetchYouTubeLatestCategory(categoryId: string): Promise<YouTubeVideo[]> {
   const searchUrl = new URL('https://www.googleapis.com/youtube/v3/search');
   searchUrl.searchParams.set('part', 'snippet');
@@ -72,18 +60,14 @@ async function fetchPreviousRanks(): Promise<Map<string, number>> {
   return ranks;
 }
 
-const [newsLatest, newsPopular, technologyLatest, technologyPopular, previousRanks] = await Promise.all([
+const [newsLatest, technologyLatest, previousRanks] = await Promise.all([
   fetchYouTubeLatestCategory('25'),
-  fetchYouTubePopularCategory('25'),
   fetchYouTubeLatestCategory('28'),
-  fetchYouTubePopularCategory('28'),
   fetchPreviousRanks(),
 ]);
 const contributions = [
   ...youtubeContributions(newsLatest, 'YouTube newest · News & Politics'),
-  ...youtubeContributions(newsPopular, 'YouTube popular · News & Politics'),
   ...youtubeContributions(technologyLatest, 'YouTube newest · Science & Technology'),
-  ...youtubeContributions(technologyPopular, 'YouTube popular · Science & Technology'),
 ];
 const snapshot = buildTrendSnapshot(contributions, {
   region,

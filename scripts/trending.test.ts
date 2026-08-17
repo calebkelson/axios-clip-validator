@@ -24,31 +24,24 @@ test('extracts relevant YouTube topics and deduplicates video ids', () => {
   assert.equal(new Set(contributions.flatMap((item) => [...item.evidenceUrls])).size, 1);
 });
 
-test('builds a plain-language summary from newest and popular YouTube signals', () => {
+test('builds a plain-language summary from newest YouTube signals', () => {
   const snapshot = buildTrendSnapshot(youtubeContributions([
     {
       id: 'one',
       snippet: { title: 'OpenAI releases a new model', categoryId: '28', publishedAt: '2026-08-17T00:00:00.000Z' },
       statistics: { viewCount: '125000', likeCount: '3000', commentCount: '200' },
     },
-  ], 'YouTube newest · Science & Technology').concat(youtubeContributions([
-    {
-      id: 'one',
-      snippet: { title: 'OpenAI releases a new model', categoryId: '28', publishedAt: '2026-08-17T00:00:00.000Z' },
-      statistics: { viewCount: '125000', likeCount: '3000', commentCount: '200' },
-    },
-  ], 'YouTube popular · Science & Technology')), {
+  ], 'YouTube newest · Science & Technology'), {
     region: 'US',
     limit: 5,
     capturedAt: '2026-08-17T06:00:00.000Z',
   });
   assert.match(snapshot.topics[0]?.summary ?? '', /new coverage appeared within the last day/);
-  assert.match(snapshot.topics[0]?.summary ?? '', /popular feed/);
   assert.match(snapshot.topics[0]?.summary ?? '', /125\.0K views/);
 });
 
 test('ranks merged sources, marks movement, and recommends the leader', () => {
-  const contributions = youtubeContributions([{ id: 'one', snippet: { title: 'OpenAI news', categoryId: '28' }, statistics: { viewCount: '900000' } }], 'YouTube popular · Science & Technology');
+  const contributions = youtubeContributions([{ id: 'one', snippet: { title: 'OpenAI news', categoryId: '28' }, statistics: { viewCount: '900000' } }], 'YouTube newest · Science & Technology');
   const snapshot = buildTrendSnapshot(contributions, {
     region: 'US',
     limit: 5,

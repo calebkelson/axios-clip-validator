@@ -200,7 +200,7 @@ export function youtubeContributions(
     const snippet = video.snippet ?? {};
     const sourceText = [text(snippet.title), text(snippet.description), ...(snippet.tags ?? [])].join(' ');
     const relevant = containsTerm(sourceText, [...POLITICS_TERMS, ...AI_TERMS]);
-    if (!relevant && !categoryLabel.startsWith('YouTube newest') && !categoryLabel.startsWith('YouTube popular')) return;
+    if (!relevant && !categoryLabel.startsWith('YouTube newest')) return;
     const viewScore = logScore(safeNumber(video.statistics?.viewCount), maxViews);
     const engagementScore = logScore(safeNumber(video.statistics?.likeCount) + safeNumber(video.statistics?.commentCount), maxEngagement);
     const score = Math.round(signalFromRank(index, values.length) * 0.55 + viewScore * 0.3 + engagementScore * 0.15);
@@ -211,7 +211,7 @@ export function youtubeContributions(
         source: 'youtube',
         topic: canonical,
         keywords: new Set([canonical, candidate, text(snippet.title)].filter(Boolean)),
-        sourceLabels: new Set(['youtube', categoryLabel.startsWith('YouTube newest') ? 'YouTube newest' : 'YouTube popular', categoryLabel.includes('News & Politics') ? 'News & Politics' : 'Science & Technology']),
+        sourceLabels: new Set(['youtube', 'YouTube newest', categoryLabel.includes('News & Politics') ? 'News & Politics' : 'Science & Technology']),
         evidenceUrls: new Set(videoId ? [`https://www.youtube.com/watch?v=${encodeURIComponent(videoId)}`] : []),
         score,
         raw: {
@@ -257,7 +257,6 @@ function summaryFor(aggregate: Aggregate, capturedAt: string): string {
   const ageHours = newestTime && Number.isFinite(capturedTime) ? Math.max(0, Math.round((capturedTime - newestTime) / 3_600_000)) : null;
   const reasons = [];
   if (labels.includes('YouTube newest') && ageHours !== null) reasons.push(ageHours <= 24 ? 'new coverage appeared within the last day' : `new coverage appeared about ${ageHours} hours ago`);
-  if (labels.includes('YouTube popular')) reasons.push('it is also appearing in YouTube’s popular feed');
   if (views > 0) reasons.push(`the leading video has about ${formatCount(views)} views`);
   if (engagement > 0) reasons.push(`with about ${formatCount(engagement)} likes and comments`);
   const reasonText = reasons.length ? reasons.join(', ') : 'it is appearing repeatedly in the tracked YouTube feeds';
