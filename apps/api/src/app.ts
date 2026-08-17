@@ -4,7 +4,7 @@ import pg from 'pg';
 import { randomUUID } from 'node:crypto';
 import { AudienceMomentSchema, AudienceSignalSchema, BrandAssetSchema, CandidateSchema, CreateJobSchema, CreateRenderSchema, CreateSourceSchema, JobSchema, ProbeSchema, RenderSchema, TranscriptSchema, UpdateCandidateSchema, YouTubeChannelSchema, YouTubeIngestRequestSchema, YouTubeSyncRequestSchema, YouTubeVideoSchema } from '@clipper/contracts';
 import { AssetStore } from '@clipper/storage';
-import { ZodError } from 'zod';
+import { z, ZodError } from 'zod';
 import { YouTubeCatalogSync, YouTubeDataApiClient, YouTubeSyncError } from './youtube-sync.js';
 import { YouTubeIngestionService } from './youtube-ingestion.js';
 import { fallbackSearchPlan, type SearchPlan } from './search.js';
@@ -278,6 +278,57 @@ const searchCaptionSql = "lower(concat_ws(' ', COALESCE(c.social_copy->>'caption
 const searchEvidenceSql = "lower(concat_ws(' ', COALESCE(c.evidence::text,''), COALESCE(c.metadata::text,'')))";
 const searchAllTextSql = `lower(concat_ws(' ', ${searchHeadlineSql}, ${searchSourceSql}, ${searchCaptionSql}, ${searchEvidenceSql}))`;
 
+const TrendTopicInputSchema = z.object({
+  topic: z.string().trim().min(1).max(160),
+  keywords: z.array(z.string().trim().min(1).max(120)).max(40).default([]),
+  summary: z.string().trim().min(1).max(600),
+  rank: z.number().int().positive(),
+  previousRank: z.number().int().positive().nullable().optional().default(null),
+  movement: z.enum(['up', 'down', 'steady', 'new']).optional().default('new'),
+  signalStrength: z.number().min(0).max(100).nullable().optional().default(null),
+  matchingClipCount: z.number().int().nonnegative().nullable().optional().default(null),
+  dailyRecommendation: z.boolean().optional().default(false),
+  sourceLabels: z.array(z.string().trim().min(1).max(80)).max(20).default([]),
+  evidenceUrls: z.array(z.string().url()).max(20).default([]),
+  raw: z.record(z.unknown()).optional().default({}),
+});
+
+const TrendSnapshotInputSchema = z.object({
+  source: z.string().trim().min(1).max(80).default('combined'),
+  region: z.string().trim().min(1).max(20).default('US'),
+  capturedAt: z.string().datetime().optional(),
+  topics: z.array(TrendTopicInputSchema).min(1).max(100),
+});
+
+function trendIngestAuthorized(request: { headers: { authorization?: string } }): boolean {
+  const expected = process.env.TRENDS_INGEST_TOKEN?.trim();
+  if (!expected) return process.env.NODE_ENV !== 'production';
+  return request.headers.authorization === `Bearer ${expected}`;
+}
+
+function transcriptSearchSql(termExpression: string) {
+  return `EXISTS (SELECT 1 FROM transcripts t WHERE t.job_id=c.job_id AND (lower(COALESCE(t.full_text,'')) LIKE '%' || lower(${termExpression}) || '%' OR EXISTS (SELECT 1 FROM transcript_segments ts WHERE ts.transcript_id=t.id AND lower(ts.text) LIKE '%' || lower(${termExpression}) || '%'))) `;
+}
+
+async function countTrendMatches(db: pg.Pool, keywords: string[]): Promise<number> {
+  const normalized = [...new Set(keywords.map((keyword) => keyword.trim().toLowerCase()).filter(Boolean))];
+  if (!normalized.length) return 0;
+  const result = await db.query(`
+    SELECT COUNT(DISTINCT c.id)::int AS count
+    FROM clip_candidates c
+    JOIN processing_jobs j ON j.id=c.job_id
+    JOIN media_sources s ON s.id=j.source_id
+    LEFT JOIN youtube_videos y ON y.media_source_id=j.source_id
+    WHERE EXISTS (
+      SELECT 1
+      FROM jsonb_array_elements_text($1::jsonb) AS keyword(value)
+      WHERE ${searchAllTextSql} LIKE '%' || lower(keyword.value) || '%'
+        OR ${transcriptSearchSql('keyword.value')}
+    )
+  `, [JSON.stringify(normalized)]);
+  return Number(result.rows[0]?.count ?? 0);
+}
+
 function dashboardSearchPredicate() {
   return `(
     ${searchAllTextSql} LIKE '%' || lower($4::text) || '%'
@@ -454,6 +505,110 @@ export function buildApp(db: pg.Pool, store: AssetStore, maxUploadBytes = 5_000_
       return { status: 'ready' };
     } catch {
       return reply.code(503).send({ status: 'not_ready' });
+    }
+  });
+
+  app.get('/v1/trending/topics', async (request) => {
+    const query = request.query as { source?: string; region?: string };
+    const source = query.source?.trim() || 'combined';
+    const region = query.region?.trim() || 'US';
+    const snapshotResult = await db.query(`
+      SELECT id, source, region, captured_at, created_at
+      FROM trend_snapshots
+      WHERE source=$1 AND region=$2
+      ORDER BY captured_at DESC, created_at DESC
+      LIMIT 1
+    `, [source, region]);
+    if (!snapshotResult.rowCount) return { snapshot: null, items: [] };
+
+    const snapshot = snapshotResult.rows[0];
+    const topicResult = await db.query(`
+      SELECT topic, keywords, summary, rank, previous_rank, movement, signal_strength,
+        matching_clip_count, daily_recommendation, source_labels, evidence_urls, raw
+      FROM trend_topics
+      WHERE snapshot_id=$1
+      ORDER BY rank ASC, topic ASC
+    `, [snapshot.id]);
+    const items = await Promise.all(topicResult.rows.map(async (row) => ({
+      topic: row.topic,
+      keywords: Array.isArray(row.keywords) ? row.keywords : [],
+      summary: row.summary,
+      rank: Number(row.rank),
+      previousRank: row.previous_rank === null ? null : Number(row.previous_rank),
+      movement: row.movement,
+      signalStrength: row.signal_strength === null ? null : Number(row.signal_strength),
+      matchingClipCount: await countTrendMatches(db, Array.isArray(row.keywords) ? row.keywords : []),
+      snapshotMatchingClipCount: row.matching_clip_count === null ? null : Number(row.matching_clip_count),
+      dailyRecommendation: row.daily_recommendation,
+      sourceLabels: Array.isArray(row.source_labels) ? row.source_labels : [],
+      evidenceUrls: Array.isArray(row.evidence_urls) ? row.evidence_urls : [],
+      raw: row.raw ?? {},
+    })));
+
+    return {
+      snapshot: {
+        id: snapshot.id,
+        source: snapshot.source,
+        region: snapshot.region,
+        capturedAt: snapshot.captured_at.toISOString(),
+        createdAt: snapshot.created_at.toISOString(),
+      },
+      items,
+    };
+  });
+
+  app.post('/v1/trending/snapshots', async (request, reply) => {
+    if (!trendIngestAuthorized(request)) return reply.code(401).send({ error: 'trend_ingest_unauthorized' });
+    const input = TrendSnapshotInputSchema.parse(request.body ?? {});
+    const capturedAt = input.capturedAt ? new Date(input.capturedAt) : new Date();
+    const client = await db.connect();
+    try {
+      await client.query('BEGIN');
+      const snapshotResult = await client.query(`
+        INSERT INTO trend_snapshots(source, region, captured_at)
+        VALUES($1,$2,$3)
+        RETURNING id, source, region, captured_at, created_at
+      `, [input.source, input.region, capturedAt]);
+      const snapshot = snapshotResult.rows[0];
+      for (const topic of input.topics) {
+        await client.query(`
+          INSERT INTO trend_topics(
+            snapshot_id, topic, keywords, summary, rank, previous_rank, movement,
+            signal_strength, matching_clip_count, daily_recommendation,
+            source_labels, evidence_urls, raw
+          ) VALUES($1,$2,$3::jsonb,$4,$5,$6,$7,$8,$9,$10,$11::jsonb,$12::jsonb,$13::jsonb)
+        `, [
+          snapshot.id,
+          topic.topic,
+          JSON.stringify(topic.keywords),
+          topic.summary,
+          topic.rank,
+          topic.previousRank,
+          topic.movement,
+          topic.signalStrength,
+          topic.matchingClipCount,
+          topic.dailyRecommendation,
+          JSON.stringify(topic.sourceLabels),
+          JSON.stringify(topic.evidenceUrls),
+          JSON.stringify(topic.raw),
+        ]);
+      }
+      await client.query('COMMIT');
+      return reply.code(201).send({
+        snapshot: {
+          id: snapshot.id,
+          source: snapshot.source,
+          region: snapshot.region,
+          capturedAt: snapshot.captured_at.toISOString(),
+          createdAt: snapshot.created_at.toISOString(),
+        },
+        topicCount: input.topics.length,
+      });
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
     }
   });
 
