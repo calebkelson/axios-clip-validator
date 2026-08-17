@@ -39,14 +39,8 @@ export type YouTubeVideo = {
   };
 };
 
-export type XTrend = {
-  trend_name?: string;
-  name?: string;
-  tweet_count?: number;
-};
-
 type SourceContribution = {
-  source: 'x' | 'youtube';
+  source: 'youtube';
   topic: string;
   keywords: Set<string>;
   sourceLabels: Set<string>;
@@ -206,7 +200,7 @@ export function youtubeContributions(
     const snippet = video.snippet ?? {};
     const sourceText = [text(snippet.title), text(snippet.description), ...(snippet.tags ?? [])].join(' ');
     const relevant = containsTerm(sourceText, [...POLITICS_TERMS, ...AI_TERMS]);
-    if (!relevant && categoryLabel !== 'News & Politics' && categoryLabel !== 'Science & Technology') return;
+    if (!relevant && !categoryLabel.startsWith('YouTube newest') && !categoryLabel.startsWith('YouTube popular')) return;
     const viewScore = logScore(safeNumber(video.statistics?.viewCount), maxViews);
     const engagementScore = logScore(safeNumber(video.statistics?.likeCount) + safeNumber(video.statistics?.commentCount), maxEngagement);
     const score = Math.round(signalFromRank(index, values.length) * 0.55 + viewScore * 0.3 + engagementScore * 0.15);
@@ -217,7 +211,7 @@ export function youtubeContributions(
         source: 'youtube',
         topic: canonical,
         keywords: new Set([canonical, candidate, text(snippet.title)].filter(Boolean)),
-        sourceLabels: new Set(['youtube', categoryLabel]),
+        sourceLabels: new Set(['youtube', categoryLabel.startsWith('YouTube newest') ? 'YouTube newest' : 'YouTube popular', categoryLabel.includes('News & Politics') ? 'News & Politics' : 'Science & Technology']),
         evidenceUrls: new Set(videoId ? [`https://www.youtube.com/watch?v=${encodeURIComponent(videoId)}`] : []),
         score,
         raw: {
@@ -228,39 +222,13 @@ export function youtubeContributions(
           channelTitle: text(snippet.channelTitle),
           publishedAt: text(snippet.publishedAt),
           viewCount: safeNumber(video.statistics?.viewCount),
+          likeCount: safeNumber(video.statistics?.likeCount),
+          commentCount: safeNumber(video.statistics?.commentCount),
         },
       });
     }
   });
   return contributions;
-}
-
-export function xContributions(trends: XTrend[]): SourceContribution[] {
-  const seen = new Set<string>();
-  const relevant = trends
-    .map((trend, index) => ({ trend, index, name: normalizeTopic(text(trend.trend_name) || text(trend.name)) }))
-    .filter(({ name }) => name && containsTerm(name, [...POLITICS_TERMS, ...AI_TERMS]))
-    .filter(({ name }) => {
-      const key = topicKey(name);
-      if (seen.has(key)) return false;
-      seen.add(key);
-      return true;
-    });
-  const maxTweets = Math.max(...relevant.map(({ trend }) => safeNumber(trend.tweet_count)), 0);
-  return relevant.map(({ trend, index, name }) => {
-    const canonical = canonicalSeed(name) ?? name;
-    const tweetCount = safeNumber(trend.tweet_count);
-    const score = Math.round(signalFromRank(index, trends.length) * 0.65 + logScore(tweetCount, maxTweets) * 0.35);
-    return {
-      source: 'x',
-      topic: canonical,
-      keywords: new Set([canonical, name]),
-      sourceLabels: new Set(['x', 'US trends']),
-      evidenceUrls: new Set([`https://x.com/search?q=${encodeURIComponent(name)}`]),
-      score,
-      raw: { source: 'x', trendName: name, tweetCount },
-    };
-  });
 }
 
 function movement(previousRank: number | null, rank: number): TrendMovement {
@@ -270,12 +238,30 @@ function movement(previousRank: number | null, rank: number): TrendMovement {
   return 'steady';
 }
 
-function summaryFor(aggregate: Aggregate): string {
+function formatCount(value: number): string {
+  if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(1)}M`;
+  if (value >= 1_000) return `${(value / 1_000).toFixed(1)}K`;
+  return value.toLocaleString();
+}
+
+function summaryFor(aggregate: Aggregate, capturedAt: string): string {
   const labels = [...aggregate.sourceLabels];
   const sample = aggregate.raw.find((raw) => text(raw.title))?.title;
-  if (labels.includes('x') && labels.includes('youtube')) return `Trending across X and YouTube${sample ? `; related coverage includes “${sample}”.` : '.'}`;
-  if (labels.includes('x')) return `Trending on X in the US${aggregate.raw[0]?.tweetCount ? ` with about ${aggregate.raw[0].tweetCount.toLocaleString()} posts.` : '.'}`;
-  return `Appearing in popular YouTube News & Politics or Science & Technology videos${sample ? `; related coverage includes “${sample}”.` : '.'}`;
+  const views = Math.max(...aggregate.raw.map((raw) => safeNumber(raw.viewCount)), 0);
+  const engagement = Math.max(...aggregate.raw.map((raw) => safeNumber(raw.likeCount) + safeNumber(raw.commentCount)), 0);
+  const publishedTimes = aggregate.raw
+    .map((raw) => Date.parse(text(raw.publishedAt)))
+    .filter((time) => Number.isFinite(time));
+  const newestTime = Math.max(...publishedTimes, 0);
+  const capturedTime = Date.parse(capturedAt);
+  const ageHours = newestTime && Number.isFinite(capturedTime) ? Math.max(0, Math.round((capturedTime - newestTime) / 3_600_000)) : null;
+  const reasons = [];
+  if (labels.includes('YouTube newest') && ageHours !== null) reasons.push(ageHours <= 24 ? 'new coverage appeared within the last day' : `new coverage appeared about ${ageHours} hours ago`);
+  if (labels.includes('YouTube popular')) reasons.push('it is also appearing in YouTube’s popular feed');
+  if (views > 0) reasons.push(`the leading video has about ${formatCount(views)} views`);
+  if (engagement > 0) reasons.push(`with about ${formatCount(engagement)} likes and comments`);
+  const reasonText = reasons.length ? reasons.join(', ') : 'it is appearing repeatedly in the tracked YouTube feeds';
+  return `Trending on YouTube because ${reasonText}${sample ? `. Related coverage: “${sample}”.` : '.'}`;
 }
 
 export function buildTrendSnapshot(
@@ -294,7 +280,7 @@ export function buildTrendSnapshot(
     return {
       topic: aggregate.topic,
       keywords: [...aggregate.keywords].slice(0, 12),
-      summary: summaryFor(aggregate),
+      summary: summaryFor(aggregate, options.capturedAt),
       rank,
       previousRank,
       movement: movement(previousRank, rank),

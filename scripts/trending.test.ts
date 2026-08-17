@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { buildTrendSnapshot, topicKey, xContributions, youtubeContributions } from './trending.js';
+import { buildTrendSnapshot, topicKey, youtubeContributions } from './trending.js';
 
 test('normalizes equivalent topic keys', () => {
   assert.equal(topicKey('#Open AI'), 'openai');
@@ -24,20 +24,31 @@ test('extracts relevant YouTube topics and deduplicates video ids', () => {
   assert.equal(new Set(contributions.flatMap((item) => [...item.evidenceUrls])).size, 1);
 });
 
-test('filters X trends to politics and AI signals', () => {
-  const contributions = xContributions([
-    { trend_name: 'Trump', tweet_count: 10000 },
-    { trend_name: 'OpenAI', tweet_count: 8000 },
-    { trend_name: 'Local Sports', tweet_count: 100000 },
-  ]);
-  assert.deepEqual(contributions.map((item) => item.topic), ['Trump', 'OpenAI']);
+test('builds a plain-language summary from newest and popular YouTube signals', () => {
+  const snapshot = buildTrendSnapshot(youtubeContributions([
+    {
+      id: 'one',
+      snippet: { title: 'OpenAI releases a new model', categoryId: '28', publishedAt: '2026-08-17T00:00:00.000Z' },
+      statistics: { viewCount: '125000', likeCount: '3000', commentCount: '200' },
+    },
+  ], 'YouTube newest · Science & Technology').concat(youtubeContributions([
+    {
+      id: 'one',
+      snippet: { title: 'OpenAI releases a new model', categoryId: '28', publishedAt: '2026-08-17T00:00:00.000Z' },
+      statistics: { viewCount: '125000', likeCount: '3000', commentCount: '200' },
+    },
+  ], 'YouTube popular · Science & Technology')), {
+    region: 'US',
+    limit: 5,
+    capturedAt: '2026-08-17T06:00:00.000Z',
+  });
+  assert.match(snapshot.topics[0]?.summary ?? '', /new coverage appeared within the last day/);
+  assert.match(snapshot.topics[0]?.summary ?? '', /popular feed/);
+  assert.match(snapshot.topics[0]?.summary ?? '', /125\.0K views/);
 });
 
 test('ranks merged sources, marks movement, and recommends the leader', () => {
-  const contributions = [
-    ...xContributions([{ trend_name: 'OpenAI', tweet_count: 10000 }, { trend_name: 'Trump', tweet_count: 5000 }]),
-    ...youtubeContributions([{ id: 'one', snippet: { title: 'OpenAI news', categoryId: '28' }, statistics: { viewCount: '900000' } }], 'Science & Technology'),
-  ];
+  const contributions = youtubeContributions([{ id: 'one', snippet: { title: 'OpenAI news', categoryId: '28' }, statistics: { viewCount: '900000' } }], 'YouTube popular · Science & Technology');
   const snapshot = buildTrendSnapshot(contributions, {
     region: 'US',
     limit: 5,
