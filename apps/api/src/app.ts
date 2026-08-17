@@ -7,7 +7,7 @@ import { AssetStore } from '@clipper/storage';
 import { ZodError } from 'zod';
 import { YouTubeCatalogSync, YouTubeDataApiClient, YouTubeSyncError } from './youtube-sync.js';
 import { YouTubeIngestionService } from './youtube-ingestion.js';
-import { expandSearchQuery, fallbackSearchPlan, type SearchPlan } from './search.js';
+import { fallbackSearchPlan, type SearchPlan } from './search.js';
 
 const toJob = (row: Record<string, any>) => JobSchema.parse({
   id: row.id,
@@ -40,6 +40,45 @@ const toProbe = (row: Record<string, any>) => ProbeSchema.parse({
   updatedAt: row.updated_at.toISOString(),
 });
 
+export type ProviderTranscriptWord = { id?: string; text: string; startSeconds: number; endSeconds: number };
+
+export function providerWordPayload(value: unknown): ProviderTranscriptWord[] {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((rawWord) => {
+    if (!rawWord || typeof rawWord !== 'object') return [];
+    const word = rawWord as Record<string, unknown>;
+    const rawText = typeof word.text === 'string' ? word.text : typeof word.word === 'string' ? word.word : '';
+    const text = rawText.trim();
+    const start = Number(word.startSeconds ?? word.start ?? word.startTime ?? word.start_time);
+    const end = Number(word.endSeconds ?? word.end ?? word.endTime ?? word.end_time);
+    if (!text || !Number.isFinite(start) || !Number.isFinite(end) || end <= start) return [];
+    const id = typeof word.id === 'string' && word.id.trim() ? word.id.trim() : undefined;
+    return [{ ...(id ? { id } : {}), text, startSeconds: start, endSeconds: end }];
+  });
+}
+
+function providerSegmentsFromPayload(value: unknown): unknown[] {
+  if (!value || typeof value !== 'object') return [];
+  const payload = value as Record<string, unknown>;
+  return Array.isArray(payload.segments) ? payload.segments : [];
+}
+
+export function mapTranscriptSegments(segments: Record<string, any>[], rawProviderPayload: unknown) {
+  const providerSegments = providerSegmentsFromPayload(rawProviderPayload);
+  return segments.map((segment, segmentIndex) => {
+    const providerSegment = providerSegments[segmentIndex];
+    const words = providerSegment && typeof providerSegment === 'object'
+      ? providerWordPayload((providerSegment as Record<string, unknown>).words)
+      : [];
+    return {
+      startSeconds: Number(segment.start_seconds),
+      endSeconds: Number(segment.end_seconds),
+      text: segment.text,
+      ...(words.length ? { words } : {}),
+    };
+  });
+}
+
 const toTranscript = (row: Record<string, any>, segments: Record<string, any>[]) => TranscriptSchema.parse({
   id: row.id,
   jobId: row.job_id,
@@ -48,7 +87,7 @@ const toTranscript = (row: Record<string, any>, segments: Record<string, any>[])
   language: row.language,
   fullText: row.full_text,
   durationSeconds: row.duration_seconds === null ? null : Number(row.duration_seconds),
-  segments: segments.map((segment) => ({ startSeconds: Number(segment.start_seconds), endSeconds: Number(segment.end_seconds), text: segment.text })),
+  segments: mapTranscriptSegments(segments, row.raw_provider_payload),
   error: row.error,
   createdAt: row.created_at.toISOString(),
   updatedAt: row.updated_at.toISOString(),
@@ -774,11 +813,6 @@ export function buildApp(db: pg.Pool, store: AssetStore, maxUploadBytes = 5_000_
   app.get('/v1/clips', async () => ({ items: (await db.query('SELECT c.*, r.id AS render_id, r.asset_id FROM clip_candidates c LEFT JOIN clip_renders r ON r.candidate_id=c.id ORDER BY c.created_at DESC')).rows.map(toCandidate) }));
   app.get('/v1/clips/search', async (request) => {
     const query = (request.query as { q?: string }).q?.trim() ?? '';
-    const searchPlan = query ? await expandSearchQuery(query, {
-      apiKey: process.env.OPENAI_API_KEY,
-      model: process.env.OPENAI_SEARCH_MODEL ?? process.env.SEARCH_MODEL ?? 'gpt-4o-mini',
-      timeoutMs: Number(process.env.SEARCH_EXPANSION_TIMEOUT_MS ?? 700),
-    }) : null;
     const responseSearchPlan = query ? fallbackSearchPlan(query) : null;
     const rows = await loadDashboardRows(db, null, query || null, 100, null);
     return {
