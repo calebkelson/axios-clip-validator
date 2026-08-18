@@ -276,7 +276,7 @@ const searchHeadlineSql = "lower(concat_ws(' ', COALESCE(c.social_copy->>'headli
 const searchSourceSql = "lower(concat_ws(' ', COALESCE(y.title,''), COALESCE(y.description,''), COALESCE(s.metadata->>'title',''), COALESCE(s.metadata->>'name',''), COALESCE(s.metadata->>'channelName',''), COALESCE(s.uri,'')))";
 const searchCaptionSql = "lower(concat_ws(' ', COALESCE(c.social_copy->>'caption',''), COALESCE(c.social_copy->>'hashtags',''), COALESCE(c.social_copy->>'optionalCta','')))";
 const searchEvidenceSql = "lower(concat_ws(' ', COALESCE(c.evidence::text,''), COALESCE(c.metadata::text,'')))";
-const searchAllTextSql = `lower(concat_ws(' ', ${searchHeadlineSql}, ${searchSourceSql}, ${searchCaptionSql}, ${searchEvidenceSql}))`;
+const searchBaseTextSql = "lower(concat_ws(' ', COALESCE(c.social_copy::text,''), COALESCE(c.metadata::text,''), COALESCE(y.title,''), COALESCE(y.description,''), COALESCE(s.metadata::text,''), COALESCE(s.uri,'')))";
 
 const TrendTopicInputSchema = z.object({
   topic: z.string().trim().min(1).max(160),
@@ -308,9 +308,9 @@ function trendIngestAuthorized(request: { headers: { authorization?: string } })
 
 function dashboardSearchPredicate() {
   return `(
-    ${searchAllTextSql} LIKE '%' || lower($4::text) || '%'
-    OR ${searchAllTextSql} LIKE ANY (SELECT '%' || lower(value) || '%' FROM unnest($5::text[]) AS exact_term(value))
-    OR ${searchAllTextSql} LIKE ANY (SELECT '%' || lower(value) || '%' FROM unnest($6::text[]) AS related_term(value))
+    ${searchBaseTextSql} LIKE '%' || lower($4::text) || '%'
+    OR ${searchBaseTextSql} LIKE ANY (SELECT '%' || lower(value) || '%' FROM unnest($5::text[]) AS exact_term(value))
+    OR ${searchBaseTextSql} LIKE ANY (SELECT '%' || lower(value) || '%' FROM unnest($6::text[]) AS related_term(value))
     OR EXISTS (SELECT 1 FROM transcripts t WHERE t.job_id=c.job_id AND lower(COALESCE(t.full_text, '')) LIKE '%' || lower($4::text) || '%')
     OR EXISTS (SELECT 1 FROM transcripts t JOIN transcript_segments ts ON ts.transcript_id=t.id WHERE t.job_id=c.job_id AND lower(ts.text) LIKE '%' || lower($4::text) || '%')
   )`;
@@ -323,8 +323,8 @@ function dashboardSearchRank() {
     + CASE WHEN ${searchCaptionSql} LIKE '%' || lower($4::text) || '%' THEN 45 ELSE 0 END
     + CASE WHEN ${searchEvidenceSql} LIKE '%' || lower($4::text) || '%' THEN 35 ELSE 0 END
     + CASE WHEN EXISTS (SELECT 1 FROM transcripts t WHERE t.job_id=c.job_id AND lower(COALESCE(t.full_text, '')) LIKE '%' || lower($4::text) || '%') THEN 60 ELSE 0 END
-    + CASE WHEN ${searchAllTextSql} LIKE ANY (SELECT '%' || lower(value) || '%' FROM unnest($5::text[]) AS exact_term(value)) THEN 30 ELSE 0 END
-    + CASE WHEN ${searchAllTextSql} LIKE ANY (SELECT '%' || lower(value) || '%' FROM unnest($6::text[]) AS related_term(value)) THEN 10 ELSE 0 END
+    + CASE WHEN ${searchBaseTextSql} LIKE ANY (SELECT '%' || lower(value) || '%' FROM unnest($5::text[]) AS exact_term(value)) THEN 30 ELSE 0 END
+    + CASE WHEN ${searchBaseTextSql} LIKE ANY (SELECT '%' || lower(value) || '%' FROM unnest($6::text[]) AS related_term(value)) THEN 10 ELSE 0 END
   ) AS search_rank`;
 }
 
