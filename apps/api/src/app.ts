@@ -485,12 +485,55 @@ const toDashboardClip = (row: Record<string, any>) => {
   };
 };
 
+const DEFAULT_CORS_ORIGINS = new Set([
+  'https://axios-clip-validator-new.axios.chatgpt.site',
+  'http://localhost:3000',
+  'http://localhost:5173',
+  'http://127.0.0.1:3000',
+  'http://127.0.0.1:5173',
+]);
+
+function configuredCorsOrigins() {
+  const configured = process.env.CORS_ORIGINS
+    ?.split(',')
+    .map((origin) => origin.trim())
+    .filter(Boolean);
+  return configured?.length ? new Set(configured) : DEFAULT_CORS_ORIGINS;
+}
+
 export function buildApp(db: pg.Pool, store: AssetStore, maxUploadBytes = 5_000_000_000) {
   const app = Fastify({ logger: true });
+  const corsOrigins = configuredCorsOrigins();
   const youtubeApiKey = process.env.YOUTUBE_DATA_API_KEY?.trim();
   const youtubeSync = youtubeApiKey ? new YouTubeCatalogSync(db, new YouTubeDataApiClient(youtubeApiKey), Number(process.env.YOUTUBE_SYNC_MAX_PAGES ?? 100)) : null;
   const youtubeIngestion = new YouTubeIngestionService(db);
   app.register(multipart, { limits: { fileSize: maxUploadBytes, files: 1 } });
+  app.addHook('onRequest', async (request, reply) => {
+    const origin = request.headers.origin;
+    if (!origin) return;
+
+    if (!corsOrigins.has(origin)) {
+      if (request.method === 'OPTIONS') return reply.code(403).send({ error: 'cors_origin_not_allowed' });
+      return;
+    }
+
+    const requestedHeaders = request.headers['access-control-request-headers'];
+    reply
+      .header('Access-Control-Allow-Origin', origin)
+      .header('Access-Control-Allow-Credentials', 'true')
+      .header('Access-Control-Allow-Methods', 'GET,POST,PATCH,PUT,DELETE,OPTIONS')
+      .header(
+        'Access-Control-Allow-Headers',
+        typeof requestedHeaders === 'string' && requestedHeaders.trim()
+          ? requestedHeaders
+          : 'Content-Type, Authorization',
+      )
+      .header('Access-Control-Expose-Headers', 'Accept-Ranges, Content-Length, Content-Range, Content-Type')
+      .header('Access-Control-Max-Age', '600')
+      .header('Vary', 'Origin');
+
+    if (request.method === 'OPTIONS') return reply.code(204).send();
+  });
   app.setErrorHandler((error, request, reply) => {
     if (error instanceof ZodError) return reply.code(400).send({ error: 'invalid_request', details: error.issues });
     if ((error as { code?: string }).code === 'FST_REQ_FILE_TOO_LARGE') return reply.code(413).send({ error: 'file_too_large' });
