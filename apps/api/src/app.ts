@@ -340,7 +340,7 @@ function dashboardSelect(smartSearch = false, options: { offsetParam: number; so
   const dateOrder = options.sort === 'oldest' ? 'ASC' : 'DESC';
   const filters = options.filters.length ? `\n    AND ${options.filters.join('\n    AND ')}` : '';
   return `
-  SELECT c.*, COUNT(*) OVER() AS total_count, j.source_id, j.status AS job_status, j.progress AS job_progress, j.last_error AS job_error,
+  SELECT c.*, j.source_id, j.status AS job_status, j.progress AS job_progress, j.last_error AS job_error,
     s.source_type, s.media_type, s.uri AS source_uri, s.metadata AS source_metadata,
     y.published_at AS youtube_published_at, y.upload_date AS youtube_upload_date,
     p.status AS probe_status, p.duration_seconds, p.width, p.height,
@@ -965,15 +965,16 @@ export function buildApp(db: pg.Pool, store: AssetStore, maxUploadBytes = 5_000_
     // Keep the queue path deterministic and database-only. The experimental
     // model-ranked SQL search can be reintroduced behind a feature flag after
     // it has been validated against every Render schema.
-    const rows = await loadDashboardRows(db, null, searchText || null, limit, null, queueOptions);
-    const totalCount = rows.length ? Number(rows[0].total_count) : null;
+    const rows = await loadDashboardRows(db, null, searchText || null, limit + 1, null, queueOptions);
+    const hasExtraPage = rows.length > limit;
+    const pageRows = hasExtraPage ? rows.slice(0, limit) : rows;
     return {
-      items: rows.map(toDashboardClip),
-      totalCount: Number.isFinite(totalCount) ? totalCount : null,
+      items: pageRows.map(toDashboardClip),
+      totalCount: null,
       offset,
       limit,
-      hasNextPage: totalCount === null ? rows.length === limit : offset + rows.length < totalCount,
-      ...(responseSearchPlan ? { search: { ...responseSearchPlan, resultRanks: rows.map((row) => Number(row.search_rank ?? 0)) } } : {}),
+      hasNextPage: hasExtraPage,
+      ...(responseSearchPlan ? { search: { ...responseSearchPlan, resultRanks: pageRows.map((row) => Number(row.search_rank ?? 0)) } } : {}),
     };
   });
 
