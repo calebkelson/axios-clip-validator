@@ -323,8 +323,21 @@ function dashboardSearchRank() {
     + CASE WHEN ${searchCaptionSql} LIKE '%' || lower($4::text) || '%' THEN 45 ELSE 0 END
     + CASE WHEN ${searchEvidenceSql} LIKE '%' || lower($4::text) || '%' THEN 35 ELSE 0 END
     + CASE WHEN EXISTS (SELECT 1 FROM transcripts t WHERE t.job_id=c.job_id AND lower(COALESCE(t.full_text, '')) LIKE '%' || lower($4::text) || '%') THEN 60 ELSE 0 END
-    + COALESCE(c.confidence, 0) * 5
+    + CASE WHEN ${searchAllTextSql} LIKE ANY (SELECT '%' || lower(value) || '%' FROM unnest($5::text[]) AS exact_term(value)) THEN 30 ELSE 0 END
+    + CASE WHEN ${searchAllTextSql} LIKE ANY (SELECT '%' || lower(value) || '%' FROM unnest($6::text[]) AS related_term(value)) THEN 10 ELSE 0 END
   ) AS search_rank`;
+}
+
+function dashboardQualityRank() {
+  return `(
+    COALESCE(c.confidence, 0) * 45
+    + COALESCE(NULLIF(audience.signal->>'audienceSignal', '')::double precision, 0) * 0.25
+    + COALESCE(NULLIF(audience.signal->>'retentionScore', '')::double precision, 0) * 0.10
+    + COALESCE(NULLIF(audience.signal->>'rewatchScore', '')::double precision, 0) * 0.10
+    + LEAST(100, 100 * LN(1 + GREATEST(COALESCE(y.view_count, 0), 0)::numeric) / LN(1000001)) * 0.05
+    + LEAST(100, 100 * LN(1 + 1000 * COALESCE(y.like_count, 0)::numeric / GREATEST(COALESCE(y.view_count, 0), 1)) / LN(101)) * 0.03
+    + LEAST(100, 100 * LN(1 + 100 * COALESCE(y.comment_count, 0)::numeric / GREATEST(COALESCE(y.view_count, 0), 1)) / LN(11)) * 0.02
+  ) AS quality_rank`;
 }
 
 type DashboardQueueOptions = {
@@ -353,7 +366,8 @@ function dashboardSelect(smartSearch = false, options: { offsetParam: number; so
     r.manifest_asset_id AS render_manifest_asset_id, r.render_manifest, r.created_at AS render_created_at,
     r.completed_at AS render_completed_at,
     audience.signal AS audience_signal,
-    audience.classifications AS audience_classifications${smartSearch ? `, ${dashboardSearchRank()}` : ''}
+    audience.classifications AS audience_classifications,
+    ${dashboardQualityRank()}${smartSearch ? `, ${dashboardSearchRank()}` : ''}
   FROM clip_candidates c
   JOIN processing_jobs j ON j.id=c.job_id
   JOIN media_sources s ON s.id=j.source_id
@@ -380,7 +394,7 @@ function dashboardSelect(smartSearch = false, options: { offsetParam: number; so
       AND $2::text IS NULL` : `($2::text IS NULL OR c.metadata::text ILIKE $2 OR c.social_copy::text ILIKE $2 OR s.metadata::text ILIKE $2 OR s.uri ILIKE $2
       OR EXISTS (SELECT 1 FROM transcripts t WHERE t.job_id=c.job_id AND t.full_text ILIKE $2)
       OR EXISTS (SELECT 1 FROM transcripts t JOIN transcript_segments ts ON ts.transcript_id=t.id WHERE t.job_id=c.job_id AND ts.text ILIKE $2))`}${filters}
-  ORDER BY ${smartSearch ? 'search_rank DESC, ' : ''}COALESCE(y.published_at, c.created_at) ${dateOrder}, c.created_at ${dateOrder}, c.id ${dateOrder}
+  ORDER BY ${smartSearch ? 'search_rank DESC, ' : ''}quality_rank DESC NULLS LAST, c.score DESC NULLS LAST, c.confidence DESC NULLS LAST, COALESCE(y.published_at, c.created_at) ${dateOrder}, c.created_at ${dateOrder}, c.id DESC
   LIMIT $3 OFFSET $${options.offsetParam}`;
 }
 
@@ -962,10 +976,7 @@ export function buildApp(db: pg.Pool, store: AssetStore, maxUploadBytes = 5_000_
       youtubeVideoId: query.youtubeVideoId ?? null,
       audience,
     };
-    // Keep the queue path deterministic and database-only. The experimental
-    // model-ranked SQL search can be reintroduced behind a feature flag after
-    // it has been validated against every Render schema.
-    const rows = await loadDashboardRows(db, null, searchText || null, limit + 1, null, queueOptions);
+    const rows = await loadDashboardRows(db, null, searchText || null, limit + 1, responseSearchPlan, queueOptions);
     const hasExtraPage = rows.length > limit;
     const pageRows = hasExtraPage ? rows.slice(0, limit) : rows;
     return {
@@ -990,7 +1001,7 @@ export function buildApp(db: pg.Pool, store: AssetStore, maxUploadBytes = 5_000_
   app.get('/v1/clips/search', async (request) => {
     const query = (request.query as { q?: string }).q?.trim() ?? '';
     const responseSearchPlan = query ? fallbackSearchPlan(query) : null;
-    const rows = await loadDashboardRows(db, null, query || null, 100, null);
+    const rows = await loadDashboardRows(db, null, query || null, 100, responseSearchPlan);
     return {
       items: rows.map(toCandidate),
       ...(responseSearchPlan ? { search: { ...responseSearchPlan, resultRanks: rows.map((row) => Number(row.search_rank ?? 0)) } } : {}),
