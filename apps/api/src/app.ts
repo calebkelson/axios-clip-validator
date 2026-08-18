@@ -306,29 +306,6 @@ function trendIngestAuthorized(request: { headers: { authorization?: string } })
   return request.headers.authorization === `Bearer ${expected}`;
 }
 
-function transcriptSearchSql(termExpression: string) {
-  return `EXISTS (SELECT 1 FROM transcripts t WHERE t.job_id=c.job_id AND (lower(COALESCE(t.full_text,'')) LIKE '%' || lower(${termExpression}) || '%' OR EXISTS (SELECT 1 FROM transcript_segments ts WHERE ts.transcript_id=t.id AND lower(ts.text) LIKE '%' || lower(${termExpression}) || '%'))) `;
-}
-
-async function countTrendMatches(db: pg.Pool, keywords: string[]): Promise<number> {
-  const normalized = [...new Set(keywords.map((keyword) => keyword.trim().toLowerCase()).filter(Boolean))];
-  if (!normalized.length) return 0;
-  const result = await db.query(`
-    SELECT COUNT(DISTINCT c.id)::int AS count
-    FROM clip_candidates c
-    JOIN processing_jobs j ON j.id=c.job_id
-    JOIN media_sources s ON s.id=j.source_id
-    LEFT JOIN youtube_videos y ON y.media_source_id=j.source_id
-    WHERE EXISTS (
-      SELECT 1
-      FROM jsonb_array_elements_text($1::jsonb) AS keyword(value)
-      WHERE ${searchAllTextSql} LIKE '%' || lower(keyword.value) || '%'
-        OR ${transcriptSearchSql('keyword.value')}
-    )
-  `, [JSON.stringify(normalized)]);
-  return Number(result.rows[0]?.count ?? 0);
-}
-
 function dashboardSearchPredicate() {
   return `(
     ${searchAllTextSql} LIKE '%' || lower($4::text) || '%'
@@ -572,7 +549,7 @@ export function buildApp(db: pg.Pool, store: AssetStore, maxUploadBytes = 5_000_
       WHERE snapshot_id=$1
       ORDER BY rank ASC, topic ASC
     `, [snapshot.id]);
-    const items = await Promise.all(topicResult.rows.map(async (row) => ({
+    const items = topicResult.rows.map((row) => ({
       topic: row.topic,
       keywords: Array.isArray(row.keywords) ? row.keywords : [],
       summary: row.summary,
@@ -580,13 +557,13 @@ export function buildApp(db: pg.Pool, store: AssetStore, maxUploadBytes = 5_000_
       previousRank: row.previous_rank === null ? null : Number(row.previous_rank),
       movement: row.movement,
       signalStrength: row.signal_strength === null ? null : Number(row.signal_strength),
-      matchingClipCount: await countTrendMatches(db, Array.isArray(row.keywords) ? row.keywords : []),
+      matchingClipCount: row.matching_clip_count === null ? 0 : Number(row.matching_clip_count),
       snapshotMatchingClipCount: row.matching_clip_count === null ? null : Number(row.matching_clip_count),
       dailyRecommendation: row.daily_recommendation,
       sourceLabels: Array.isArray(row.source_labels) ? row.source_labels : [],
       evidenceUrls: Array.isArray(row.evidence_urls) ? row.evidence_urls : [],
       raw: row.raw ?? {},
-    })));
+    }));
 
     return {
       snapshot: {
