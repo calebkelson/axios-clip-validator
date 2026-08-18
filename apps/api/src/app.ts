@@ -342,15 +342,16 @@ function dashboardQualityRank() {
 
 type DashboardQueueOptions = {
   offset?: number;
-  sort?: 'newest' | 'oldest';
+  sort?: 'quality' | 'newest' | 'oldest';
   stage?: 'all' | 'review' | 'rendering' | 'ready' | 'posted';
   source?: 'youtube' | 'non_youtube' | null;
   youtubeVideoId?: string | null;
   audience?: string[];
 };
 
-function dashboardSelect(smartSearch = false, options: { offsetParam: number; sort: 'newest' | 'oldest'; filters: string[] }) {
+function dashboardSelect(smartSearch = false, options: { offsetParam: number; sort: 'quality' | 'newest' | 'oldest'; filters: string[] }) {
   const dateOrder = options.sort === 'oldest' ? 'ASC' : 'DESC';
+  const dateSorted = options.sort === 'newest' || options.sort === 'oldest';
   const filters = options.filters.length ? `\n    AND ${options.filters.join('\n    AND ')}` : '';
   return `
   SELECT c.*, j.source_id, j.status AS job_status, j.progress AS job_progress, j.last_error AS job_error,
@@ -394,14 +395,16 @@ function dashboardSelect(smartSearch = false, options: { offsetParam: number; so
       AND $2::text IS NULL` : `($2::text IS NULL OR c.metadata::text ILIKE $2 OR c.social_copy::text ILIKE $2 OR s.metadata::text ILIKE $2 OR s.uri ILIKE $2
       OR EXISTS (SELECT 1 FROM transcripts t WHERE t.job_id=c.job_id AND t.full_text ILIKE $2)
       OR EXISTS (SELECT 1 FROM transcripts t JOIN transcript_segments ts ON ts.transcript_id=t.id WHERE t.job_id=c.job_id AND ts.text ILIKE $2))`}${filters}
-  ORDER BY ${smartSearch ? 'search_rank DESC, ' : ''}quality_rank DESC NULLS LAST, c.score DESC NULLS LAST, c.confidence DESC NULLS LAST, COALESCE(y.published_at, c.created_at) ${dateOrder}, c.created_at ${dateOrder}, c.id DESC
+  ORDER BY ${dateSorted
+    ? `COALESCE(y.published_at, c.created_at) ${dateOrder}, c.created_at ${dateOrder}, c.id ${dateOrder}`
+    : `${smartSearch ? 'search_rank DESC, ' : ''}quality_rank DESC NULLS LAST, c.score DESC NULLS LAST, c.confidence DESC NULLS LAST, COALESCE(y.published_at, c.created_at) DESC, c.created_at DESC, c.id DESC`}
   LIMIT $3 OFFSET $${options.offsetParam}`;
 }
 
 async function loadDashboardRows(db: pg.Pool, candidateId: string | null, query: string | null, limit: number, searchPlan: SearchPlan | null = null, options: DashboardQueueOptions = {}) {
   const smartSearch = Boolean(searchPlan);
   const offset = Math.max(Number(options.offset ?? 0) || 0, 0);
-  const sort = options.sort === 'oldest' ? 'oldest' : 'newest';
+  const sort = options.sort === 'oldest' || options.sort === 'newest' ? options.sort : 'quality';
   const params: unknown[] = smartSearch && searchPlan
     ? [candidateId, null, limit, searchPlan.exactPhrase, searchPlan.exactTerms, searchPlan.relatedTerms, offset]
     : [candidateId, query ? `%${query}%` : null, limit, offset];
@@ -970,7 +973,7 @@ export function buildApp(db: pg.Pool, store: AssetStore, maxUploadBytes = 5_000_
     const responseSearchPlan = searchText ? fallbackSearchPlan(searchText) : null;
     const queueOptions: DashboardQueueOptions = {
       offset,
-      sort: query.sort === 'oldest' ? 'oldest' as const : 'newest' as const,
+      sort: query.sort === 'oldest' || query.sort === 'newest' ? query.sort : 'quality' as const,
       stage: stage as DashboardQueueOptions['stage'],
       source: source as DashboardQueueOptions['source'],
       youtubeVideoId: query.youtubeVideoId ?? null,

@@ -44,3 +44,13 @@ test('clip search uses the same relevance-then-quality ordering', async () => {
   const query = await captureQueueQuery('/v1/clips/search?q=Trump');
   assert.match(query.sql, /search_rank DESC, quality_rank DESC NULLS LAST/);
 });
+
+test('explicit newest and oldest sorting override quality ranking', async () => {
+  const newest = await captureQueueQuery('/v1/dashboard/queue?sort=newest&limit=5');
+  assert.match(newest.sql, /ORDER BY COALESCE\(y\.published_at, c\.created_at\) DESC, c\.created_at DESC, c\.id DESC/);
+  assert.doesNotMatch(newest.sql, /quality_rank DESC/);
+
+  const oldest = await captureQueueQuery('/v1/dashboard/queue?sort=oldest&limit=5');
+  assert.match(oldest.sql, /ORDER BY COALESCE\(y\.published_at, c\.created_at\) ASC, c\.created_at ASC, c\.id ASC/);
+  assert.doesNotMatch(oldest.sql, /quality_rank DESC/);
+});
