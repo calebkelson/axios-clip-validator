@@ -48,6 +48,7 @@ export const CandidateSocialCopySchema = z.object({
   // editor state before it reaches the worker.
   transcriptEdits: z.unknown().optional(),
   subtitlePosition: z.unknown().optional(),
+  logoPositionPercent: z.object({ x: z.number().min(0).max(100), y: z.number().min(0).max(100) }).optional(),
 });
 export const CandidateEvidenceSchema = z.object({ startSeconds: z.number().nonnegative(), endSeconds: z.number().nonnegative(), text: z.string().min(1) });
 export const AudienceConfidenceLabelSchema = z.enum(['low', 'medium', 'high']);

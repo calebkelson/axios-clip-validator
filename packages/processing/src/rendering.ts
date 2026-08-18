@@ -177,7 +177,7 @@ export class RenderProcessor {
     const duration = (endSeconds - startSeconds).toFixed(3);
     const args = ['-y', '-ss', startSeconds.toFixed(3), '-i', sourcePath];
     if (job.include_logo && logoPath) {
-      const position = logoOverlayPosition(profile, logoPosition);
+      const position = logoOverlayPosition(profile, logoPosition, readLogoPositionPercent(job.social_copy));
       args.push('-loop', '1', '-i', logoPath, '-filter_complex', `[0:v]${baseFilter}[base];[1:v]scale=-1:${profile.logoHeight}[logo];[base][logo]overlay=${position.x}:${position.y}:format=auto[v]`, '-map', '[v]');
     } else {
       args.push('-vf', baseFilter, '-map', '0:v:0');
@@ -423,7 +423,23 @@ function wrapHeadline(text: string, widthPercent = 40) {
   return lines.join('\n');
 }
 
-export function logoOverlayPosition(profile: typeof renderProfiles[RenderProfileName], position: LogoPosition) {
+function readLogoPositionPercent(socialCopy: Record<string, unknown>): { x: number; y: number } | undefined {
+  const raw = socialCopy.logoPositionPercent;
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+  const point = raw as { x?: unknown; y?: unknown };
+  const x = Number(point.x);
+  const y = Number(point.y);
+  if (!Number.isFinite(x) || !Number.isFinite(y)) return undefined;
+  return { x: Math.max(0, Math.min(100, x)), y: Math.max(0, Math.min(100, y)) };
+}
+
+export function logoOverlayPosition(profile: typeof renderProfiles[RenderProfileName], position: LogoPosition, freePosition?: { x: number; y: number }) {
+  if (freePosition) {
+    return {
+      x: `((main_w-overlay_w)*${freePosition.x}/100)`,
+      y: `((main_h-overlay_h)*${freePosition.y}/100)`,
+    };
+  }
   const x = position.endsWith('left') ? String(profile.marginX) : position.endsWith('right') ? `main_w-overlay_w-${profile.marginX}` : '(main_w-overlay_w)/2';
   const y = position.startsWith('top') ? String(profile.safeTop) : position.startsWith('bottom') ? `main_h-overlay_h-${profile.safeBottom}` : '(main_h-overlay_h)/2';
   return { x, y };

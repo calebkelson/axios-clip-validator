@@ -35,3 +35,10 @@ test('logo placement uses the seven approved template anchors', () => {
   assert.deepEqual(logoOverlayPosition(renderProfiles.vertical_reel, 'bottom-right'), { x: 'main_w-overlay_w-64', y: 'main_h-overlay_h-280' });
   assert.deepEqual(logoOverlayPosition(renderProfiles.square, 'center'), { x: '(main_w-overlay_w)/2', y: '(main_h-overlay_h)/2' });
 });
+
+test('logo placement accepts a freeform percentage position', () => {
+  assert.deepEqual(logoOverlayPosition(renderProfiles.vertical_reel, 'top-left', { x: 27.5, y: 63 }), {
+    x: '((main_w-overlay_w)*27.5/100)',
+    y: '((main_h-overlay_h)*63/100)',
+  });
+});
