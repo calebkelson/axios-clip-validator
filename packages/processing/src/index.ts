@@ -9,6 +9,8 @@ import { AssetStore } from '@clipper/storage';
 import { CandidateProposal, EditorialCandidateProvider, createEditorialCandidateProvider } from './candidates.js';
 import { createPlatformSourceAdapter, PlatformSourceAdapter } from './source-adapters.js';
 export { RenderProcessor, buildAss, buildSrt, formatSrtTime, renderProfiles } from './rendering.js';
+export { ThumbnailProcessor, Sam3SidecarClient, Sam3UnavailableError, U2NetpSegmentationProvider, buildExactFrameExtractionArgs, createThumbnailManifest, segmentThumbnail } from './thumbnailing.js';
+export type { ThumbnailBox, ThumbnailCommandRunner, ThumbnailSegmentationInput, ThumbnailSegmentationProvider } from './thumbnailing.js';
 export { createPlatformSourceAdapter, PlatformSourceAdapter, YtDlpSourceAdapter } from './source-adapters.js';
 export * from './audience-signals/index.js';
 
