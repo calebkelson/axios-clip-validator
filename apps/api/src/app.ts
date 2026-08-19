@@ -2,8 +2,9 @@ import Fastify from 'fastify';
 import multipart from '@fastify/multipart';
 import pg from 'pg';
 import { randomUUID } from 'node:crypto';
+import { Readable } from 'node:stream';
 import { AudienceMomentSchema, AudienceSignalSchema, BrandAssetSchema, CandidateSchema, CreateJobSchema, CreateRenderSchema, CreateSourceSchema, JobSchema, ProbeSchema, RenderSchema, TranscriptSchema, UpdateCandidateSchema, YouTubeChannelSchema, YouTubeIngestRequestSchema, YouTubeSyncRequestSchema, YouTubeVideoSchema } from '@clipper/contracts';
-import { AssetStore } from '@clipper/storage';
+import { AssetStore, type MultipartAssetStore } from '@clipper/storage';
 import { z, ZodError } from 'zod';
 import { YouTubeCatalogSync, YouTubeDataApiClient, YouTubeSyncError } from './youtube-sync.js';
 import { YouTubeIngestionService } from './youtube-ingestion.js';
@@ -479,6 +480,73 @@ const toDashboardClip = (row: Record<string, any>) => {
   };
 };
 
+const MultipartUploadPrepareSchema = z.object({
+  filename: z.string().min(1).max(500),
+  contentType: z.string().min(1).max(255).default('application/octet-stream'),
+  byteSize: z.number().int().positive(),
+  mediaType: z.enum(['video', 'audio']).default('video'),
+  sourceTitle: z.string().max(500).default(''),
+});
+
+const MultipartUploadCompleteSchema = z.object({
+  parts: z.array(z.object({ partNumber: z.number().int().min(1).max(10_000), etag: z.string().min(1).max(512) })).min(1).max(10_000),
+});
+
+type PendingUpload = {
+  uploadId: string;
+  storageKey: string;
+  expectedByteSize: number;
+  contentType: string;
+  originalFilename: string;
+  sourceTitle: string;
+  mediaType: 'video' | 'audio';
+  partSizeBytes: number;
+  totalParts: number;
+};
+
+function multipartStoreFor(store: AssetStore): (AssetStore & MultipartAssetStore) | null {
+  const candidate = store as AssetStore & Partial<MultipartAssetStore>;
+  if (
+    typeof candidate.createMultipartUpload !== 'function'
+    || typeof candidate.uploadPart !== 'function'
+    || typeof candidate.completeMultipartUpload !== 'function'
+    || typeof candidate.abortMultipartUpload !== 'function'
+    || typeof candidate.head !== 'function'
+  ) return null;
+  return candidate as AssetStore & MultipartAssetStore;
+}
+
+function pendingUploadFromSource(row: Record<string, any>): PendingUpload | null {
+  const upload = row.metadata?.uploadSession;
+  if (!upload || typeof upload !== 'object') return null;
+  if (typeof upload.completedAt === 'string' && upload.completedAt) return null;
+  const parsed = {
+    uploadId: upload.uploadId,
+    storageKey: upload.storageKey,
+    expectedByteSize: Number(upload.expectedByteSize),
+    contentType: upload.contentType,
+    originalFilename: upload.originalFilename,
+    sourceTitle: upload.sourceTitle ?? '',
+    mediaType: upload.mediaType,
+    partSizeBytes: Number(upload.partSizeBytes),
+    totalParts: Number(upload.totalParts),
+  };
+  if (
+    typeof parsed.uploadId !== 'string'
+    || typeof parsed.storageKey !== 'string'
+    || !Number.isSafeInteger(parsed.expectedByteSize)
+    || parsed.expectedByteSize <= 0
+    || typeof parsed.contentType !== 'string'
+    || typeof parsed.originalFilename !== 'string'
+    || (parsed.mediaType !== 'video' && parsed.mediaType !== 'audio')
+    || !Number.isSafeInteger(parsed.partSizeBytes)
+    || parsed.partSizeBytes < 5 * 1024 * 1024
+    || !Number.isSafeInteger(parsed.totalParts)
+    || parsed.totalParts < 1
+  ) return null;
+  return parsed;
+}
+
 const DEFAULT_CORS_ORIGINS = new Set([
   'https://axios-clip-validator-new.axios.chatgpt.site',
   'http://localhost:3000',
@@ -496,12 +564,16 @@ function configuredCorsOrigins() {
 }
 
 export function buildApp(db: pg.Pool, store: AssetStore, maxUploadBytes = 5_000_000_000) {
-  const app = Fastify({ logger: true });
+  const uploadPartBytes = Math.max(5 * 1024 * 1024, Number(process.env.UPLOAD_PART_BYTES ?? 64 * 1024 * 1024));
+  const app = Fastify({ logger: true, bodyLimit: uploadPartBytes + 1024 * 1024 });
   const corsOrigins = configuredCorsOrigins();
   const youtubeApiKey = process.env.YOUTUBE_DATA_API_KEY?.trim();
   const youtubeSync = youtubeApiKey ? new YouTubeCatalogSync(db, new YouTubeDataApiClient(youtubeApiKey), Number(process.env.YOUTUBE_SYNC_MAX_PAGES ?? 100)) : null;
   const youtubeIngestion = new YouTubeIngestionService(db);
   app.register(multipart, { limits: { fileSize: maxUploadBytes, files: 1 } });
+  // Fastify's built-in parser types are buffer/string. This only buffers one
+  // bounded part (64 MiB by default), never the complete source file.
+  app.addContentTypeParser('application/octet-stream', { parseAs: 'buffer' }, (_request, body, done) => done(null, body));
   app.addHook('onRequest', async (request, reply) => {
     const origin = request.headers.origin;
     if (!origin) return;
@@ -787,6 +859,124 @@ export function buildApp(db: pg.Pool, store: AssetStore, maxUploadBytes = 5_000_
     const result = await db.query("INSERT INTO media_sources(source_type,media_type,uri,canonical_url,provider,metadata) VALUES($1,$2,$3,CASE WHEN $1='platform_url' THEN $3 ELSE NULL END,$4,$5) RETURNING *", [input.sourceType, input.mediaType, input.uri, input.provider ?? null, input.metadata]);
     const row = result.rows[0];
     return reply.code(201).send({ id: row.id, sourceType: row.source_type, mediaType: row.media_type, uri: row.uri, canonicalUrl: row.canonical_url, provider: row.provider, metadata: row.metadata, createdAt: row.created_at.toISOString() });
+  });
+
+  // The hosted dashboard runs behind a Cloudflare Worker, whose request body
+  // limit is much smaller than the 5 GB source limit. Keep each part below
+  // that edge limit and assemble the object in R2 without buffering it in the
+  // API process.
+  app.post('/v1/uploads/multipart', async (request, reply) => {
+    const multipartStore = multipartStoreFor(store);
+    if (!multipartStore) return reply.code(501).send({ error: 'multipart_upload_unavailable' });
+    const input = MultipartUploadPrepareSchema.parse(request.body);
+    if (input.byteSize > maxUploadBytes) return reply.code(413).send({ error: 'file_too_large' });
+
+    const sourceId = randomUUID();
+    const safeName = input.filename.replace(/[^a-zA-Z0-9._-]/g, '_').slice(-120) || 'upload.bin';
+    const storageKey = `uploads/${sourceId}/${safeName}`;
+    const totalParts = Math.ceil(input.byteSize / uploadPartBytes);
+    const upload = await multipartStore.createMultipartUpload(storageKey, input.contentType);
+    const session: PendingUpload = {
+      uploadId: upload.uploadId,
+      storageKey,
+      expectedByteSize: input.byteSize,
+      contentType: input.contentType,
+      originalFilename: input.filename,
+      sourceTitle: input.sourceTitle.trim(),
+      mediaType: input.mediaType,
+      partSizeBytes: uploadPartBytes,
+      totalParts,
+    };
+    try {
+      await db.query("INSERT INTO media_sources(id,source_type,media_type,uri,metadata) VALUES($1,'upload',$2,$3,$4)", [
+        sourceId,
+        input.mediaType,
+        store.getPublicReference(storageKey),
+        {
+          originalFilename: input.filename,
+          uploadedContentType: input.contentType,
+          ...(input.sourceTitle.trim() ? { title: input.sourceTitle.trim() } : {}),
+          uploadSession: session,
+        },
+      ]);
+    } catch (error) {
+      await multipartStore.abortMultipartUpload(storageKey, upload.uploadId).catch(() => undefined);
+      throw error;
+    }
+    return reply.code(201).send({
+      sourceId,
+      uploadId: upload.uploadId,
+      partSizeBytes: uploadPartBytes,
+      totalParts,
+    });
+  });
+
+  app.post('/v1/uploads/multipart/:sourceId/parts/:partNumber', async (request, reply) => {
+    const multipartStore = multipartStoreFor(store);
+    if (!multipartStore) return reply.code(501).send({ error: 'multipart_upload_unavailable' });
+    const { sourceId, partNumber: rawPartNumber } = request.params as { sourceId: string; partNumber: string };
+    const partNumber = Number(rawPartNumber);
+    const source = await db.query('SELECT id,source_type,metadata FROM media_sources WHERE id=$1', [sourceId]);
+    if (!source.rowCount || source.rows[0].source_type !== 'upload') return reply.code(404).send({ error: 'upload_not_found' });
+    const session = pendingUploadFromSource(source.rows[0]);
+    if (!session) return reply.code(409).send({ error: 'upload_not_pending' });
+    if (!Number.isInteger(partNumber) || partNumber < 1 || partNumber > session.totalParts) return reply.code(400).send({ error: 'invalid_part_number' });
+
+    const sizeHeader = request.headers['x-upload-part-size'] ?? request.headers['content-length'];
+    const contentLength = Number(Array.isArray(sizeHeader) ? sizeHeader[0] : sizeHeader);
+    if (!Number.isSafeInteger(contentLength) || contentLength <= 0 || contentLength > session.partSizeBytes) return reply.code(400).send({ error: 'invalid_part_size' });
+    const expectedPartSize = partNumber < session.totalParts
+      ? session.partSizeBytes
+      : session.expectedByteSize - (session.totalParts - 1) * session.partSizeBytes;
+    if (contentLength !== expectedPartSize) return reply.code(400).send({ error: 'unexpected_part_size', expected: expectedPartSize, received: contentLength });
+
+    const body = request.body as Buffer;
+    const result = await multipartStore.uploadPart(session.storageKey, session.uploadId, partNumber, Readable.from(body), contentLength);
+    return reply.send({ partNumber, etag: result.etag });
+  });
+
+  app.post('/v1/uploads/multipart/:sourceId/complete', async (request, reply) => {
+    const multipartStore = multipartStoreFor(store);
+    if (!multipartStore) return reply.code(501).send({ error: 'multipart_upload_unavailable' });
+    const { sourceId } = request.params as { sourceId: string };
+    const input = MultipartUploadCompleteSchema.parse(request.body);
+    const source = await db.query('SELECT id,source_type,media_type,uri,metadata,created_at FROM media_sources WHERE id=$1', [sourceId]);
+    if (!source.rowCount || source.rows[0].source_type !== 'upload') return reply.code(404).send({ error: 'upload_not_found' });
+    const existingAsset = await db.query("SELECT id,storage_key,content_type,byte_size,public_reference FROM assets WHERE source_id=$1 AND role='source' ORDER BY created_at DESC LIMIT 1", [sourceId]);
+    if (existingAsset.rowCount) return reply.send({ source: { id: sourceId, sourceType: 'upload', mediaType: source.rows[0].media_type, uri: source.rows[0].uri }, asset: existingAsset.rows[0] });
+    const session = pendingUploadFromSource(source.rows[0]);
+    if (!session) {
+      return reply.code(409).send({ error: 'upload_not_pending' });
+    }
+    const partNumbers = input.parts.map((part) => part.partNumber);
+    if (new Set(partNumbers).size !== partNumbers.length || partNumbers.length !== session.totalParts || partNumbers.some((partNumber, index) => partNumber !== index + 1)) {
+      return reply.code(400).send({ error: 'invalid_multipart_parts' });
+    }
+
+    await multipartStore.completeMultipartUpload(session.storageKey, session.uploadId, input.parts);
+    const object = await multipartStore.head(session.storageKey);
+    if (object.byteSize !== session.expectedByteSize) {
+      await store.delete(session.storageKey).catch(() => undefined);
+      await db.query('DELETE FROM media_sources WHERE id=$1', [sourceId]);
+      return reply.code(400).send({ error: 'upload_size_mismatch', expected: session.expectedByteSize, received: object.byteSize });
+    }
+    const metadata = { ...(source.rows[0].metadata ?? {}), uploadSession: { ...session, completedAt: new Date().toISOString() } };
+    const asset = await db.query("INSERT INTO assets(source_id,storage_key,role,content_type,byte_size,public_reference,metadata) VALUES($1,$2,'source',$3,$4,$5,$6) RETURNING id,storage_key,content_type,byte_size,public_reference", [sourceId, session.storageKey, object.contentType ?? session.contentType, object.byteSize, store.getPublicReference(session.storageKey), { originalFilename: session.originalFilename }]);
+    await db.query('UPDATE media_sources SET metadata=$2 WHERE id=$1', [sourceId, metadata]);
+    return reply.code(201).send({ source: { id: sourceId, sourceType: 'upload', mediaType: session.mediaType, uri: store.getPublicReference(session.storageKey) }, asset: asset.rows[0] });
+  });
+
+  app.post('/v1/uploads/multipart/:sourceId/abort', async (request, reply) => {
+    const multipartStore = multipartStoreFor(store);
+    if (!multipartStore) return reply.code(501).send({ error: 'multipart_upload_unavailable' });
+    const { sourceId } = request.params as { sourceId: string };
+    const source = await db.query('SELECT metadata FROM media_sources WHERE id=$1', [sourceId]);
+    if (!source.rowCount) return reply.code(404).send({ error: 'upload_not_found' });
+    const session = pendingUploadFromSource(source.rows[0]);
+    if (session) await multipartStore.abortMultipartUpload(session.storageKey, session.uploadId).catch(() => undefined);
+    const existingAsset = await db.query("SELECT id FROM assets WHERE source_id=$1 AND role='source' LIMIT 1", [sourceId]);
+    if (!existingAsset.rowCount) await db.query('DELETE FROM media_sources WHERE id=$1', [sourceId]);
+    return reply.code(204).send();
   });
 
   app.post('/v1/uploads', async (request, reply) => {
