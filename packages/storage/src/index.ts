@@ -4,7 +4,7 @@ import { copyFile, mkdir, readFile, rename, rm, stat, writeFile } from 'node:fs/
 import { extname, join, resolve } from 'node:path';
 import { Readable, Transform } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
-import { DeleteObjectCommand, GetObjectCommand, HeadObjectCommand, PutObjectCommand, S3Client } from '@aws-sdk/client-s3';
+import { AbortMultipartUploadCommand, CompleteMultipartUploadCommand, CreateMultipartUploadCommand, DeleteObjectCommand, GetObjectCommand, HeadObjectCommand, PutObjectCommand, S3Client, UploadPartCommand, type UploadPartCommandInput } from '@aws-sdk/client-s3';
 import { Upload } from '@aws-sdk/lib-storage';
 
 export interface AssetRange {
@@ -26,6 +26,19 @@ export interface AssetStore {
   materialize(key: string, workDir: string): Promise<string>;
   delete(key: string): Promise<void>;
   getPublicReference(key: string): string;
+}
+
+/**
+ * Optional large-upload capability. The API uses this only when the backing
+ * store can accept resumable parts; local disk keeps the existing streamed
+ * multipart endpoint as its fallback.
+ */
+export interface MultipartAssetStore {
+  createMultipartUpload(key: string, contentType: string): Promise<{ uploadId: string }>;
+  uploadPart(key: string, uploadId: string, partNumber: number, stream: NodeJS.ReadableStream, contentLength: number): Promise<{ etag: string }>;
+  completeMultipartUpload(key: string, uploadId: string, parts: Array<{ partNumber: number; etag: string }>): Promise<void>;
+  abortMultipartUpload(key: string, uploadId: string): Promise<void>;
+  head(key: string): Promise<{ byteSize: number; contentType: string | null }>;
 }
 
 export class LocalAssetStore implements AssetStore {
@@ -132,6 +145,59 @@ export class R2AssetStore implements AssetStore {
     });
     await Promise.all([pipeline(stream, counter.transform), upload.done()]);
     return { key: safeKey, byteSize: counter.byteSize() };
+  }
+
+  async createMultipartUpload(key: string, contentType: string) {
+    const safeKey = assertAssetKey(key);
+    const response = await this.client.send(new CreateMultipartUploadCommand({
+      Bucket: this.bucket,
+      Key: safeKey,
+      ContentType: contentType,
+    }));
+    if (!response.UploadId) throw new Error('R2 did not return a multipart upload id');
+    return { uploadId: response.UploadId };
+  }
+
+  async uploadPart(key: string, uploadId: string, partNumber: number, stream: NodeJS.ReadableStream, contentLength: number) {
+    const safeKey = assertAssetKey(key);
+    if (!Number.isInteger(partNumber) || partNumber < 1 || partNumber > 10_000) throw new Error('Invalid multipart part number');
+    if (!Number.isSafeInteger(contentLength) || contentLength <= 0) throw new Error('Invalid multipart part size');
+    const response = await this.client.send(new UploadPartCommand({
+      Bucket: this.bucket,
+      Key: safeKey,
+      UploadId: uploadId,
+      PartNumber: partNumber,
+      Body: stream as UploadPartCommandInput['Body'],
+      ContentLength: contentLength,
+    }));
+    if (!response.ETag) throw new Error(`R2 did not return an ETag for multipart part ${partNumber}`);
+    return { etag: response.ETag };
+  }
+
+  async completeMultipartUpload(key: string, uploadId: string, parts: Array<{ partNumber: number; etag: string }>) {
+    const safeKey = assertAssetKey(key);
+    if (!parts.length) throw new Error('At least one multipart part is required');
+    await this.client.send(new CompleteMultipartUploadCommand({
+      Bucket: this.bucket,
+      Key: safeKey,
+      UploadId: uploadId,
+      MultipartUpload: {
+        Parts: parts
+          .sort((left, right) => left.partNumber - right.partNumber)
+          .map((part) => ({ PartNumber: part.partNumber, ETag: part.etag })),
+      },
+    }));
+  }
+
+  async abortMultipartUpload(key: string, uploadId: string) {
+    await this.client.send(new AbortMultipartUploadCommand({ Bucket: this.bucket, Key: assertAssetKey(key), UploadId: uploadId }));
+  }
+
+  async head(key: string) {
+    const response = await this.client.send(new HeadObjectCommand({ Bucket: this.bucket, Key: assertAssetKey(key) }));
+    const byteSize = Number(response.ContentLength ?? 0);
+    if (!Number.isSafeInteger(byteSize) || byteSize < 0) throw new Error('R2 object has no usable size');
+    return { byteSize, contentType: response.ContentType ?? null };
   }
 
   async get(key: string) {
