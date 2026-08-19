@@ -10,6 +10,8 @@ import { CandidateProposal, EditorialCandidateProvider, createEditorialCandidate
 import { createPlatformSourceAdapter, PlatformSourceAdapter } from './source-adapters.js';
 import { PlaybackPreviewGenerator } from './playback-preview.js';
 export { RenderProcessor, buildAss, buildSrt, formatSrtTime, renderProfiles } from './rendering.js';
+export { ThumbnailProcessor, Sam3SidecarClient, Sam3UnavailableError, U2NetpSegmentationProvider, buildExactFrameExtractionArgs, createThumbnailManifest, segmentThumbnail } from './thumbnailing.js';
+export type { ThumbnailBox, ThumbnailCommandRunner, ThumbnailSegmentationInput, ThumbnailSegmentationProvider } from './thumbnailing.js';
 export { createPlatformSourceAdapter, PlatformSourceAdapter, YtDlpSourceAdapter } from './source-adapters.js';
 export { PlaybackPreviewGenerator, buildPlaybackPreviewArgs } from './playback-preview.js';
 export * from './audience-signals/index.js';

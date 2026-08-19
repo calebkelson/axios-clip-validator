@@ -2,7 +2,7 @@ import Fastify from 'fastify';
 import multipart from '@fastify/multipart';
 import pg from 'pg';
 import { randomUUID } from 'node:crypto';
-import { AudienceMomentSchema, AudienceSignalSchema, BrandAssetSchema, CandidateSchema, CreateJobSchema, CreateRenderSchema, CreateSourceSchema, JobSchema, ProbeSchema, RenderSchema, TranscriptSchema, UpdateCandidateSchema, YouTubeChannelSchema, YouTubeIngestRequestSchema, YouTubeSyncRequestSchema, YouTubeVideoSchema } from '@clipper/contracts';
+import { AudienceMomentSchema, AudienceSignalSchema, BrandAssetSchema, CandidateSchema, CreateJobSchema, CreateRenderSchema, CreateSourceSchema, JobSchema, ProbeSchema, RenderSchema, ThumbnailCreateSchema, ThumbnailJobSchema, ThumbnailProjectSchema, TranscriptSchema, UpdateCandidateSchema, YouTubeChannelSchema, YouTubeIngestRequestSchema, YouTubeSyncRequestSchema, YouTubeVideoSchema } from '@clipper/contracts';
 import { AssetStore } from '@clipper/storage';
 import { ZodError } from 'zod';
 import { YouTubeCatalogSync, YouTubeDataApiClient, YouTubeSyncError } from './youtube-sync.js';
@@ -120,6 +120,51 @@ const toRender = (row: Record<string, any>) => RenderSchema.parse({
   createdAt: row.created_at.toISOString(),
   completedAt: row.completed_at?.toISOString?.() ?? null,
 });
+
+const toThumbnailProject = (row: Record<string, any>) => ThumbnailProjectSchema.parse({
+  id: row.id,
+  candidateId: row.candidate_id,
+  sourceId: row.source_id,
+  frameSeconds: Number(row.frame_seconds),
+  sourceHeadlineCardId: row.source_headline_card_id ?? null,
+  brandAssetId: row.brand_asset_id ?? null,
+  segmentationProvider: row.segmentation_provider,
+  positiveBox: row.positive_box ?? null,
+  negativeBoxes: Array.isArray(row.negative_boxes) ? row.negative_boxes : [],
+  manifest: row.manifest_json ?? null,
+  sourceFrameAssetId: row.source_frame_asset_id ?? null,
+  subjectAssetId: row.subject_asset_id ?? null,
+  previewAssetId: row.preview_asset_id ?? null,
+  exportAssetId: row.export_asset_id ?? null,
+  sourceFrameUrl: row.source_frame_asset_id ? `/v1/assets/${row.source_frame_asset_id}` : null,
+  subjectUrl: row.subject_asset_id ? `/v1/assets/${row.subject_asset_id}` : null,
+  previewUrl: row.preview_asset_id ? `/v1/assets/${row.preview_asset_id}` : null,
+  exportUrl: row.export_asset_id ? `/v1/assets/${row.export_asset_id}` : null,
+  status: row.status,
+  error: row.error ?? null,
+  createdAt: row.created_at.toISOString(),
+  updatedAt: row.updated_at.toISOString(),
+});
+
+const toThumbnailJob = (row: Record<string, any>) => ThumbnailJobSchema.parse({
+  id: row.id,
+  thumbnailProjectId: row.thumbnail_project_id,
+  status: row.status,
+  progress: row.progress,
+  attempts: row.attempts,
+  claimedAt: row.claimed_at?.toISOString?.() ?? null,
+  leaseExpiresAt: row.lease_expires_at?.toISOString?.() ?? null,
+  error: row.error ?? null,
+  createdAt: row.created_at.toISOString(),
+  updatedAt: row.updated_at.toISOString(),
+});
+
+function candidateHasHeadlineCard(socialCopy: unknown, headlineCardId: string | null) {
+  if (!headlineCardId) return true;
+  if (!socialCopy || typeof socialCopy !== 'object') return false;
+  const headlineCards = (socialCopy as { headlineCards?: unknown }).headlineCards;
+  return Array.isArray(headlineCards) && headlineCards.some((card) => card && typeof card === 'object' && (card as { id?: unknown }).id === headlineCardId);
+}
 
 type AudienceRetentionRow = {
   segment_start_seconds: number | string;
@@ -549,6 +594,140 @@ export function buildApp(db: pg.Pool, store: AssetStore, maxUploadBytes = 5_000_
     const { candidateId } = request.params as { candidateId: string };
     const result = await db.query('SELECT * FROM clip_candidates WHERE id=$1', [candidateId]);
     return result.rowCount ? toCandidate(result.rows[0]) : reply.code(404).send({ error: 'candidate_not_found' });
+  });
+
+  app.post('/v1/candidates/:candidateId/thumbnails', async (request, reply) => {
+    const { candidateId } = request.params as { candidateId: string };
+    const input = ThumbnailCreateSchema.parse(request.body ?? {});
+    const candidate = await db.query(`
+      SELECT candidate.id,candidate.start_seconds,candidate.edited_start_seconds,candidate.social_copy,
+        job.source_id,source.media_type,probe.duration_seconds
+      FROM clip_candidates AS candidate
+      JOIN processing_jobs AS job ON job.id=candidate.job_id
+      JOIN media_sources AS source ON source.id=job.source_id
+      LEFT JOIN source_probes AS probe ON probe.source_id=job.source_id
+      WHERE candidate.id=$1
+    `, [candidateId]);
+    if (!candidate.rowCount) return reply.code(404).send({ error: 'candidate_not_found' });
+    const candidateRow = candidate.rows[0];
+    if (candidateRow.media_type !== 'video') return reply.code(400).send({ error: 'thumbnail_source_must_be_video' });
+    const frameSeconds = input.frameSeconds ?? Number(candidateRow.edited_start_seconds ?? candidateRow.start_seconds);
+    const durationSeconds = candidateRow.duration_seconds === null ? null : Number(candidateRow.duration_seconds);
+    if (!Number.isFinite(frameSeconds) || frameSeconds < 0 || (durationSeconds !== null && frameSeconds > durationSeconds)) {
+      return reply.code(400).send({ error: 'invalid_thumbnail_frame' });
+    }
+    if (!candidateHasHeadlineCard(candidateRow.social_copy, input.sourceHeadlineCardId)) return reply.code(400).send({ error: 'headline_card_not_found' });
+    if (input.brandAssetId) {
+      const brand = await db.query('SELECT 1 FROM brand_assets WHERE id=$1 AND active=true', [input.brandAssetId]);
+      if (!brand.rowCount) return reply.code(400).send({ error: 'brand_asset_not_found' });
+    }
+    const configuredProvider = input.segmentationProvider
+      ?? (process.env.THUMBNAIL_SEGMENTATION_PROVIDER === 'sam3' || process.env.THUMBNAIL_SEGMENTATION_PROVIDER === 'u2netp' ? process.env.THUMBNAIL_SEGMENTATION_PROVIDER : undefined);
+    const segmentationProvider = configuredProvider ?? (input.positiveBox ? 'sam3' : 'u2netp');
+    if (segmentationProvider === 'sam3' && !input.positiveBox) return reply.code(400).send({ error: 'sam3_positive_box_required' });
+
+    const client = await db.connect();
+    try {
+      await client.query('BEGIN');
+      const project = await client.query(`
+        INSERT INTO thumbnail_projects(candidate_id,source_id,frame_seconds,source_headline_card_id,brand_asset_id,segmentation_provider,positive_box,negative_boxes)
+        VALUES($1,$2,$3,$4,$5,$6,$7::jsonb,$8::jsonb)
+        RETURNING *
+      `, [candidateId, candidateRow.source_id, frameSeconds, input.sourceHeadlineCardId, input.brandAssetId, segmentationProvider, input.positiveBox ? JSON.stringify(input.positiveBox) : null, JSON.stringify(input.negativeBoxes)]);
+      const job = await client.query('INSERT INTO thumbnail_jobs(thumbnail_project_id) VALUES($1) RETURNING *', [project.rows[0].id]);
+      await client.query('COMMIT');
+      return reply.code(201).send({ project: toThumbnailProject(project.rows[0]), job: toThumbnailJob(job.rows[0]) });
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
+  });
+
+  app.get('/v1/thumbnails/:thumbnailId', async (request, reply) => {
+    const { thumbnailId } = request.params as { thumbnailId: string };
+    const project = await db.query('SELECT * FROM thumbnail_projects WHERE id=$1', [thumbnailId]);
+    if (!project.rowCount) return reply.code(404).send({ error: 'thumbnail_not_found' });
+    const jobs = await db.query('SELECT * FROM thumbnail_jobs WHERE thumbnail_project_id=$1 ORDER BY created_at DESC', [thumbnailId]);
+    return { project: toThumbnailProject(project.rows[0]), jobs: jobs.rows.map(toThumbnailJob) };
+  });
+
+  app.patch('/v1/thumbnails/:thumbnailId', async (request, reply) => {
+    const { thumbnailId } = request.params as { thumbnailId: string };
+    const input = ThumbnailCreateSchema.partial().parse(request.body ?? {});
+    if (!Object.keys(input).length) return reply.code(400).send({ error: 'thumbnail_update_required' });
+    const current = await db.query(`
+      SELECT project.*,candidate.social_copy,probe.duration_seconds
+      FROM thumbnail_projects AS project
+      JOIN clip_candidates AS candidate ON candidate.id=project.candidate_id
+      LEFT JOIN source_probes AS probe ON probe.source_id=project.source_id
+      WHERE project.id=$1
+    `, [thumbnailId]);
+    if (!current.rowCount) return reply.code(404).send({ error: 'thumbnail_not_found' });
+    const row = current.rows[0];
+    if (row.status === 'processing' || row.status === 'exporting') return reply.code(409).send({ error: 'thumbnail_busy' });
+    const frameSeconds = input.frameSeconds ?? Number(row.frame_seconds);
+    const durationSeconds = row.duration_seconds === null ? null : Number(row.duration_seconds);
+    if (!Number.isFinite(frameSeconds) || frameSeconds < 0 || (durationSeconds !== null && frameSeconds > durationSeconds)) return reply.code(400).send({ error: 'invalid_thumbnail_frame' });
+    const sourceHeadlineCardId = input.sourceHeadlineCardId === undefined ? row.source_headline_card_id : input.sourceHeadlineCardId;
+    if (!candidateHasHeadlineCard(row.social_copy, sourceHeadlineCardId)) return reply.code(400).send({ error: 'headline_card_not_found' });
+    const brandAssetId = input.brandAssetId === undefined ? row.brand_asset_id : input.brandAssetId;
+    if (brandAssetId) {
+      const brand = await db.query('SELECT 1 FROM brand_assets WHERE id=$1 AND active=true', [brandAssetId]);
+      if (!brand.rowCount) return reply.code(400).send({ error: 'brand_asset_not_found' });
+    }
+    const positiveBox = input.positiveBox === undefined ? row.positive_box : input.positiveBox;
+    const negativeBoxes = input.negativeBoxes === undefined ? row.negative_boxes : input.negativeBoxes;
+    const segmentationProvider = input.segmentationProvider
+      ?? (input.positiveBox !== undefined ? (positiveBox ? 'sam3' : 'u2netp') : row.segmentation_provider);
+    if (segmentationProvider === 'sam3' && !positiveBox) return reply.code(400).send({ error: 'sam3_positive_box_required' });
+
+    const client = await db.connect();
+    try {
+      await client.query('BEGIN');
+      await client.query("UPDATE thumbnail_jobs SET status='cancelled',lease_expires_at=NULL,updated_at=now() WHERE thumbnail_project_id=$1 AND status='queued'", [thumbnailId]);
+      const project = await client.query(`
+        UPDATE thumbnail_projects
+        SET frame_seconds=$2,source_headline_card_id=$3,brand_asset_id=$4,segmentation_provider=$5,
+          positive_box=$6::jsonb,negative_boxes=$7::jsonb,manifest_json=NULL,source_frame_asset_id=NULL,
+          subject_asset_id=NULL,preview_asset_id=NULL,export_asset_id=NULL,status='queued',error=NULL,updated_at=now()
+        WHERE id=$1
+        RETURNING *
+      `, [thumbnailId, frameSeconds, sourceHeadlineCardId, brandAssetId, segmentationProvider, positiveBox ? JSON.stringify(positiveBox) : null, JSON.stringify(negativeBoxes)]);
+      const job = await client.query('INSERT INTO thumbnail_jobs(thumbnail_project_id) VALUES($1) RETURNING *', [thumbnailId]);
+      await client.query('COMMIT');
+      return { project: toThumbnailProject(project.rows[0]), job: toThumbnailJob(job.rows[0]) };
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
+  });
+
+  app.post('/v1/thumbnails/:thumbnailId/export', async (request, reply) => {
+    const { thumbnailId } = request.params as { thumbnailId: string };
+    const client = await db.connect();
+    try {
+      await client.query('BEGIN');
+      const project = await client.query("UPDATE thumbnail_projects SET status='export_queued',error=NULL,updated_at=now() WHERE id=$1 AND status IN ('ready','completed') RETURNING *", [thumbnailId]);
+      if (!project.rowCount) {
+        const exists = await client.query('SELECT status FROM thumbnail_projects WHERE id=$1', [thumbnailId]);
+        await client.query('ROLLBACK');
+        return exists.rowCount
+          ? reply.code(409).send({ error: 'thumbnail_not_ready', status: exists.rows[0].status })
+          : reply.code(404).send({ error: 'thumbnail_not_found' });
+      }
+      const job = await client.query('INSERT INTO thumbnail_jobs(thumbnail_project_id) VALUES($1) RETURNING *', [thumbnailId]);
+      await client.query('COMMIT');
+      return reply.code(202).send({ project: toThumbnailProject(project.rows[0]), job: toThumbnailJob(job.rows[0]) });
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
   });
 
   app.get('/v1/candidates/:candidateId/audience', async (request, reply) => {
