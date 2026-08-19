@@ -149,4 +149,60 @@ export const YouTubeIngestRequestSchema = z.object({
 export const CreateRenderSchema = z.object({ profile: z.enum(renderProfiles).default('vertical_reel'), fitMode: z.enum(renderFitModes).default('cover'), background: z.enum(renderBackgrounds).default('dark_blue'), logoPosition: z.enum(logoPositions).default('top-left'), logoAssetId: z.string().uuid().nullable().default(null), captionMode: z.enum(captionModes).default('burned'), includeLogo: z.boolean().default(true), renderSpec: RenderSpecSchema.optional() });
 export const RenderSchema = z.object({ id: z.string().uuid(), candidateId: z.string().uuid(), profile: z.enum(renderProfiles), fitMode: z.enum(renderFitModes), background: z.enum(renderBackgrounds).default('dark_blue'), logoPosition: z.enum(logoPositions), logoAssetId: z.string().uuid().nullable(), captionMode: z.enum(captionModes), includeLogo: z.boolean(), renderSpec: RenderSpecSchema.nullable().default(null), status: z.enum(jobStates), progress: z.number().int().min(0).max(100), attempts: z.number().int().nonnegative(), error: z.string().nullable(), assetId: z.string().uuid().nullable(), captionAssetId: z.string().uuid().nullable(), thumbnailAssetId: z.string().uuid().nullable(), manifestAssetId: z.string().uuid().nullable(), renderManifest: z.record(z.unknown()).nullable(), playbackUrl: z.string().nullable(), captionsUrl: z.string().nullable(), thumbnailUrl: z.string().nullable(), manifestUrl: z.string().nullable(), createdAt: z.string().datetime(), completedAt: z.string().datetime().nullable() });
 export type CreateSource = z.infer<typeof CreateSourceSchema>; export type CreateJob = z.infer<typeof CreateJobSchema>; export type Job = z.infer<typeof JobSchema>; export type Probe = z.infer<typeof ProbeSchema>; export type Transcript = z.infer<typeof TranscriptSchema>; export type Candidate = z.infer<typeof CandidateSchema>; export type BrandAsset = z.infer<typeof BrandAssetSchema>; export type RenderSpec = z.infer<typeof RenderSpecSchema>; export type Render = z.infer<typeof RenderSchema>;
+export const thumbnailSegmentationProviders = ['sam3', 'u2netp'] as const;
+export const thumbnailProjectStates = ['queued', 'processing', 'ready', 'export_queued', 'exporting', 'completed', 'failed'] as const;
+export const ThumbnailBoxSchema = z.object({ x: z.number().nonnegative(), y: z.number().nonnegative(), width: z.number().positive(), height: z.number().positive() });
+export const ThumbnailCreateSchema = z.object({
+  frameSeconds: z.number().nonnegative().optional(),
+  sourceHeadlineCardId: z.string().min(1).max(80).nullable().default(null),
+  brandAssetId: z.string().uuid().nullable().default(null),
+  segmentationProvider: z.enum(thumbnailSegmentationProviders).optional(),
+  positiveBox: ThumbnailBoxSchema.nullable().default(null),
+  negativeBoxes: z.array(ThumbnailBoxSchema).max(32).default([]),
+});
+export const ThumbnailManifestSchema = z.object({
+  schema: z.literal('axios.thumbnail.manifest.v1'),
+  projectId: z.string().uuid(),
+  candidateId: z.string().uuid(),
+  sourceId: z.string().uuid(),
+  frameSeconds: z.number().nonnegative(),
+  dimensions: z.object({ width: z.number().int().positive(), height: z.number().int().positive() }),
+  segmentation: z.object({ provider: z.enum(thumbnailSegmentationProviders), positiveBox: ThumbnailBoxSchema.nullable(), negativeBoxes: z.array(ThumbnailBoxSchema) }),
+  headlineCard: z.object({ id: z.string(), text: z.string(), color: z.string().nullable() }).nullable(),
+  branding: z.object({ brandAssetId: z.string().uuid().nullable(), assetId: z.string().uuid().nullable() }),
+  assets: z.object({
+    sourceFrame: z.object({ key: z.string(), assetId: z.string().uuid().nullable() }),
+    subject: z.object({ key: z.string(), assetId: z.string().uuid().nullable() }),
+    preview: z.object({ key: z.string(), assetId: z.string().uuid().nullable() }),
+    manifest: z.object({ key: z.string() }),
+    export: z.object({ key: z.string(), assetId: z.string().uuid().nullable() }),
+  }),
+  createdAt: z.string().datetime(),
+});
+export const ThumbnailProjectSchema = z.object({
+  id: z.string().uuid(),
+  candidateId: z.string().uuid(),
+  sourceId: z.string().uuid(),
+  frameSeconds: z.number().nonnegative(),
+  sourceHeadlineCardId: z.string().nullable(),
+  brandAssetId: z.string().uuid().nullable(),
+  segmentationProvider: z.enum(thumbnailSegmentationProviders),
+  positiveBox: ThumbnailBoxSchema.nullable(),
+  negativeBoxes: z.array(ThumbnailBoxSchema),
+  manifest: ThumbnailManifestSchema.nullable(),
+  sourceFrameAssetId: z.string().uuid().nullable(),
+  subjectAssetId: z.string().uuid().nullable(),
+  previewAssetId: z.string().uuid().nullable(),
+  exportAssetId: z.string().uuid().nullable(),
+  sourceFrameUrl: z.string().nullable(),
+  subjectUrl: z.string().nullable(),
+  previewUrl: z.string().nullable(),
+  exportUrl: z.string().nullable(),
+  status: z.enum(thumbnailProjectStates),
+  error: z.string().nullable(),
+  createdAt: z.string().datetime(),
+  updatedAt: z.string().datetime(),
+});
+export const ThumbnailJobSchema = z.object({ id: z.string().uuid(), thumbnailProjectId: z.string().uuid(), status: z.enum(jobStates), progress: z.number().int().min(0).max(100), attempts: z.number().int().nonnegative(), claimedAt: z.string().datetime().nullable(), leaseExpiresAt: z.string().datetime().nullable(), error: z.string().nullable(), createdAt: z.string().datetime(), updatedAt: z.string().datetime() });
+export type ThumbnailCreate = z.infer<typeof ThumbnailCreateSchema>; export type ThumbnailManifest = z.infer<typeof ThumbnailManifestSchema>; export type ThumbnailProject = z.infer<typeof ThumbnailProjectSchema>; export type ThumbnailJob = z.infer<typeof ThumbnailJobSchema>;
 export const validTransition = (from: typeof jobStates[number], to: typeof jobStates[number]) => ({ queued: ['processing', 'cancelled'], processing: ['queued', 'completed', 'failed', 'cancelled'], completed: [], failed: [], cancelled: [] }[from] as string[]).includes(to);

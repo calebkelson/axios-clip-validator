@@ -1,13 +1,14 @@
 import pg from 'pg';
-import { MediaProcessor, RenderProcessor } from '@clipper/processing';
+import { MediaProcessor, RenderProcessor, ThumbnailProcessor } from '@clipper/processing';
 import { createAssetStore } from '@clipper/storage';
 
 const db = new pg.Pool({ connectionString: process.env.DATABASE_URL });
 const store = createAssetStore();
 const mediaWorker = new MediaProcessor(db, store, Number(process.env.LEASE_SECONDS ?? 60));
 const renderWorker = new RenderProcessor(db, store, Number(process.env.RENDER_LEASE_SECONDS ?? process.env.LEASE_SECONDS ?? 60));
+const thumbnailWorker = new ThumbnailProcessor(db, store, Number(process.env.THUMBNAIL_LEASE_SECONDS ?? process.env.LEASE_SECONDS ?? 120));
 const concurrency = Number(process.env.WORKER_CONCURRENCY ?? 1);
-if (concurrency !== 1) console.warn('Phase 4 worker currently runs one leased media or render job at a time');
+if (concurrency !== 1) console.warn('Worker currently runs one leased media, render, or thumbnail job at a time');
 
 let running = false;
 const tick = async () => {
@@ -15,7 +16,10 @@ const tick = async () => {
   running = true;
   try {
     const mediaJob = await mediaWorker.runOnce();
-    if (!mediaJob) await renderWorker.runOnce();
+    if (!mediaJob) {
+      const thumbnailJob = await thumbnailWorker.runOnce();
+      if (!thumbnailJob) await renderWorker.runOnce();
+    }
   } finally {
     running = false;
   }
