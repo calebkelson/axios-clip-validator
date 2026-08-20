@@ -1,33 +1,24 @@
 import { spawn } from 'node:child_process';
 import { createReadStream } from 'node:fs';
-import { copyFile, mkdir, readFile, rm, stat } from 'node:fs/promises';
+import { mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import type pg from 'pg';
 import type { AssetStore } from '@clipper/storage';
 
 export type ThumbnailBox = { x: number; y: number; width: number; height: number };
-export const THUMBNAIL_LAYOUT_PRESETS = ['original', 'bold_statement', 'topic_first', 'quote_hook', 'data_callout', 'split_focus', 'clean_cut'] as const;
-export type ThumbnailLayoutPreset = typeof THUMBNAIL_LAYOUT_PRESETS[number];
-export type ThumbnailComposition = {
-  layoutPreset: ThumbnailLayoutPreset;
-  subject: { position: { x: number; y: number }; scale: number };
-  headline: { text: string; sourceCardId: string | null };
-  background: { preset: 'black' | 'white' | 'dark_blue' | 'blurred' };
-  logo: { enabled: boolean; brandAssetId: string | null; assetId: string | null; position: 'top-left' | 'top-center' | 'top-right' | 'center' | 'bottom-left' | 'bottom-center' | 'bottom-right' };
-};
 
 export type ThumbnailSegmentationInput = {
   sourceFramePath: string;
   outputPath: string;
   positiveBox: ThumbnailBox | null;
   negativeBoxes: ThumbnailBox[];
+  protectedBoxes: ThumbnailBox[];
 };
 
 export interface ThumbnailSegmentationProvider {
   readonly name: 'sam3' | 'u2netp';
   segment(input: ThumbnailSegmentationInput): Promise<void>;
 }
-
 export type ThumbnailCommandRunner = (command: string, args: string[]) => Promise<void>;
 
 export class Sam3UnavailableError extends Error {
@@ -37,7 +28,8 @@ export class Sam3UnavailableError extends Error {
   }
 }
 
-/** HTTP client for the optional SAM3 sidecar. The sidecar returns a transparent PNG. */
+/** HTTP client for the local SAM3 sidecar. The sidecar reads the worker's
+ * frame path and returns paths to the generated subject and mask files. */
 export class Sam3SidecarClient implements ThumbnailSegmentationProvider {
   readonly name = 'sam3' as const;
 
@@ -53,18 +45,14 @@ export class Sam3SidecarClient implements ThumbnailSegmentationProvider {
       framePath: input.sourceFramePath,
       positiveBox: input.positiveBox,
       negativeBoxes: input.negativeBoxes,
+      protectedBoxes: input.protectedBoxes,
     });
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), this.timeoutMs);
     try {
       let response: Response;
       try {
-        response = await fetch(sidecarEndpoint(this.baseUrl), {
-          method: 'POST',
-          headers: { 'content-type': 'application/json', accept: 'application/json' },
-          body,
-          signal: controller.signal,
-        });
+        response = await fetch(sidecarEndpoint(this.baseUrl), { method: 'POST', headers: { 'content-type': 'application/json' }, body, signal: controller.signal });
       } catch (error) {
         throw new Sam3UnavailableError('SAM3 sidecar is unavailable', { cause: error });
       }
@@ -75,21 +63,20 @@ export class Sam3SidecarClient implements ThumbnailSegmentationProvider {
         }
         throw new Error(`SAM3 segmentation failed with HTTP ${response.status}: ${details}`);
       }
-      const result = await response.json() as { subjectPngPath?: unknown; subjectPath?: unknown; maskPath?: unknown };
-      const subjectPath = typeof result.subjectPngPath === 'string' && result.subjectPngPath
-        ? result.subjectPngPath
-        : typeof result.subjectPath === 'string' && result.subjectPath
-          ? result.subjectPath
-          : null;
-      if (!subjectPath) {
-        throw new Error('SAM3 sidecar response did not contain subjectPngPath or subjectPath');
+      const contentType = response.headers.get('content-type') ?? '';
+      if (contentType.startsWith('image/')) {
+        await writeFile(input.outputPath, new Uint8Array(await response.arrayBuffer()));
+        return;
       }
-      if (typeof result.maskPath !== 'string' || !result.maskPath) {
-        throw new Error('SAM3 sidecar response did not contain maskPath');
+      const result = await response.json() as { subjectPath?: string; subjectPngPath?: string; subjectBase64?: string; imageBase64?: string; outputBase64?: string };
+      const subjectPath = result.subjectPath ?? result.subjectPngPath;
+      if (subjectPath) {
+        await writeFile(input.outputPath, await readFile(subjectPath));
+        return;
       }
-      await validateSidecarFile(subjectPath, 'subjectPngPath');
-      await validateSidecarFile(result.maskPath, 'maskPath');
-      await copyFile(subjectPath, input.outputPath);
+      const encoded = result.subjectBase64 ?? result.imageBase64 ?? result.outputBase64;
+      if (!encoded) throw new Error('SAM3 sidecar response did not contain a subject path or segmented image');
+      await writeFile(input.outputPath, Buffer.from(encoded.replace(/^data:image\/\w+;base64,/, ''), 'base64'));
     } finally {
       clearTimeout(timeout);
     }
@@ -120,6 +107,7 @@ type ThumbnailProjectRow = {
   segmentation_provider: 'sam3' | 'u2netp';
   positive_box: ThumbnailBox | null;
   negative_boxes: ThumbnailBox[];
+  protected_boxes: ThumbnailBox[];
   manifest_json: Record<string, unknown> | null;
   source_frame_asset_id: string | null;
   subject_asset_id: string | null;
@@ -130,9 +118,35 @@ type ThumbnailProjectRow = {
 };
 
 type StoredThumbnailAsset = { id: string; storage_key: string };
-type StoredVariantAssets = Partial<Record<ThumbnailLayoutPreset, StoredThumbnailAsset>>;
 
 type HeadlineCard = { id: string; text: string; color: string | null };
+export type ThumbnailLayoutPreset = 'original' | 'bold_statement' | 'topic_first' | 'quote_hook' | 'data_callout' | 'split_focus' | 'clean_cut' | 'behind_numbers' | 'question' | 'event_stage' | 'minimal_portrait' | 'motion_gradient' | 'framed_insight';
+type ThumbnailBackgroundPreset = 'source' | 'dark_blue' | 'black' | 'white' | 'gradient_blue' | 'gradient_cobalt' | 'gradient_royal' | 'gradient_dark' | 'gradient_white_blue';
+type ThumbnailTextAlignment = 'left' | 'center' | 'right';
+export type ThumbnailComposition = {
+  layoutPreset: ThumbnailLayoutPreset;
+  subject: { position: { x: number; y: number }; scale: number };
+  headline: { sourceCardId: string | null; resolvedText: string; text: string; size: number; alignment: ThumbnailTextAlignment };
+  backgroundPreset: ThumbnailBackgroundPreset;
+  logo: { brandAssetId: string | null; position: 'top-left' | 'top-center' | 'top-right' | 'center' | 'bottom-left' | 'bottom-center' | 'bottom-right' };
+};
+type ThumbnailVariant = { layoutPreset: ThumbnailLayoutPreset; label: string; key: string; assetId: string | null };
+const THUMBNAIL_VARIANTS: Array<{ layoutPreset: ThumbnailLayoutPreset; label: string }> = [
+  { layoutPreset: 'original', label: 'Original frame' },
+  { layoutPreset: 'bold_statement', label: 'Bold statement' },
+  { layoutPreset: 'topic_first', label: 'Topic first' },
+  { layoutPreset: 'quote_hook', label: 'Quote hook' },
+  { layoutPreset: 'data_callout', label: 'Data callout' },
+  { layoutPreset: 'split_focus', label: 'Split focus' },
+  { layoutPreset: 'clean_cut', label: 'Clean cut' },
+  { layoutPreset: 'behind_numbers', label: 'Behind the numbers' },
+  { layoutPreset: 'question', label: 'The question' },
+  { layoutPreset: 'event_stage', label: 'Event / stage' },
+  { layoutPreset: 'minimal_portrait', label: 'Minimal portrait' },
+  { layoutPreset: 'motion_gradient', label: 'Motion gradient' },
+  { layoutPreset: 'framed_insight', label: 'Framed insight' },
+];
+export const THUMBNAIL_LAYOUT_PRESETS = THUMBNAIL_VARIANTS.map((variant) => variant.layoutPreset) as ThumbnailLayoutPreset[];
 
 export type ThumbnailManifestInput = {
   project: ThumbnailProjectRow;
@@ -145,7 +159,7 @@ export type ThumbnailManifestInput = {
   previewAssetId: string | null;
   exportAssetId: string | null;
   composition?: ThumbnailComposition;
-  variantAssets?: StoredVariantAssets;
+  variants?: ThumbnailVariant[];
   createdAt?: string;
   width?: number;
   height?: number;
@@ -153,11 +167,7 @@ export type ThumbnailManifestInput = {
 
 export function createThumbnailManifest(input: ThumbnailManifestInput) {
   const projectId = input.project.id;
-  const composition = input.composition ?? defaultThumbnailComposition(input.project, input.headlineCard, input.brandAssetId, input.brandAssetDbId);
-  const variants = Object.fromEntries(THUMBNAIL_LAYOUT_PRESETS.map((preset) => [preset, {
-    key: `thumbnails/${projectId}/variants/${preset}.jpg`,
-    assetId: input.variantAssets?.[preset]?.id ?? null,
-  }])) as Record<ThumbnailLayoutPreset, { key: string; assetId: string | null }>;
+  const composition = input.composition ?? compositionFromManifest(input.project.manifest_json, input.headlineCard, input.brandAssetId);
   return {
     schema: 'axios.thumbnail.manifest.v1' as const,
     projectId,
@@ -169,24 +179,49 @@ export function createThumbnailManifest(input: ThumbnailManifestInput) {
       provider: input.provider,
       positiveBox: input.project.positive_box ?? null,
       negativeBoxes: Array.isArray(input.project.negative_boxes) ? input.project.negative_boxes : [],
+      protectedBoxes: Array.isArray(input.project.protected_boxes) ? input.project.protected_boxes : [],
     },
     headlineCard: input.headlineCard,
     branding: { brandAssetId: input.brandAssetId, assetId: input.brandAssetDbId },
     composition,
+    variants: input.variants ?? manifestVariants(input.project.manifest_json),
     assets: {
-      sourceFrame: { key: `thumbnails/${projectId}/source-frame.jpg`, assetId: input.sourceFrameAssetId },
+      sourceFrame: { key: `thumbnails/${projectId}/source-frame.png`, assetId: input.sourceFrameAssetId },
       subject: { key: `thumbnails/${projectId}/subject.png`, assetId: input.subjectAssetId },
       preview: { key: `thumbnails/${projectId}/preview.jpg`, assetId: input.previewAssetId },
-      manifest: { key: `thumbnails/${projectId}/manifest.json` },
+      manifest: { key: `thumbnails/${projectId}/thumbnail-manifest.json` },
       export: { key: `thumbnails/${projectId}/export.png`, assetId: input.exportAssetId },
-      variants,
     },
     createdAt: input.createdAt ?? new Date().toISOString(),
   };
 }
 
+function compositionFromManifest(manifest: Record<string, unknown> | null, headlineCard: HeadlineCard | null, brandAssetId: string | null): ThumbnailComposition {
+  const raw = manifest?.composition;
+  if (raw && typeof raw === 'object') {
+    const value = raw as Partial<ThumbnailComposition>;
+    if (typeof value.layoutPreset === 'string' && value.subject && value.headline && typeof value.backgroundPreset === 'string' && value.logo) return value as ThumbnailComposition;
+  }
+  return {
+    layoutPreset: 'clean_cut',
+    subject: { position: { x: 0.68, y: 0.54 }, scale: 1 },
+    headline: { sourceCardId: headlineCard?.id ?? null, resolvedText: headlineText(headlineCard), text: headlineText(headlineCard), size: 64, alignment: 'left' },
+    backgroundPreset: 'gradient_blue',
+    logo: { brandAssetId, position: 'top-left' },
+  };
+}
+
+function headlineText(headlineCard: HeadlineCard | null) {
+  return headlineCard?.text ?? '';
+}
+
+function manifestVariants(manifest: Record<string, unknown> | null): ThumbnailVariant[] {
+  const variants = manifest?.variants;
+  return Array.isArray(variants) ? variants as ThumbnailVariant[] : [];
+}
+
 export function buildExactFrameExtractionArgs(sourcePath: string, frameSeconds: number, outputPath: string) {
-  return ['-y', '-i', sourcePath, '-ss', frameSeconds.toFixed(3), '-map', '0:v:0', '-frames:v', '1', '-c:v', 'mjpeg', '-q:v', '2', outputPath];
+  return ['-y', '-i', sourcePath, '-ss', frameSeconds.toFixed(3), '-map', '0:v:0', '-frames:v', '1', '-c:v', 'png', outputPath];
 }
 
 export async function segmentThumbnail(
@@ -314,100 +349,66 @@ export class ThumbnailProcessor {
   }
 
   private async processPreview(jobId: string, project: ThumbnailProjectRow, workDir: string) {
-    if (project.source_frame_asset_id && project.subject_asset_id && project.manifest_json) {
-      await this.processLayoutUpdate(jobId, project, workDir);
-      return;
-    }
-    const sourcePath = await this.store.materialize(project.source_storage_key, join(workDir, 'source'));
-    const sourceFramePath = join(workDir, 'source-frame.jpg');
+    const sourceFramePath = join(workDir, 'source-frame.png');
     const subjectPath = join(workDir, 'subject.png');
-    await this.commandRunner(this.ffmpegBinary, buildExactFrameExtractionArgs(sourcePath, Number(project.frame_seconds), sourceFramePath));
-    const sourceFrame = await this.storeFile(project.source_id, project.id, 'source-frame.jpg', sourceFramePath, 'image/jpeg');
+    const previewPath = join(workDir, 'preview.jpg');
+    let sourceFrameAssetId = project.source_frame_asset_id;
+    let subjectAssetId = project.subject_asset_id;
+    if (sourceFrameAssetId) {
+      await this.materializeAsset(sourceFrameAssetId, sourceFramePath);
+    } else {
+      const sourcePath = await this.store.materialize(project.source_storage_key, join(workDir, 'source'));
+      await this.commandRunner(this.ffmpegBinary, buildExactFrameExtractionArgs(sourcePath, Number(project.frame_seconds), sourceFramePath));
+      sourceFrameAssetId = (await this.storeFile(project.source_id, project.id, 'source-frame.png', sourceFramePath, 'image/png')).id;
+    }
     await this.updateProgress(jobId, 30);
 
-    const provider = await this.segment(project, sourceFramePath, subjectPath);
-    await validatePngOutput(subjectPath);
-    const subject = await this.storeFile(project.source_id, project.id, 'subject.png', subjectPath, 'image/png');
+    let provider = project.segmentation_provider;
+    if (subjectAssetId) {
+      await this.materializeAsset(subjectAssetId, subjectPath);
+    } else {
+      provider = await this.segment(project, sourceFramePath, subjectPath);
+      subjectAssetId = (await this.storeFile(project.source_id, project.id, 'subject.png', subjectPath, 'image/png')).id;
+    }
     await this.updateProgress(jobId, 55);
 
     const headlineCard = selectedHeadlineCard(project.social_copy, project.source_headline_card_id);
     const brand = await this.resolveBrandAsset(project.brand_asset_id, workDir);
-    const composition = defaultThumbnailComposition(project, headlineCard, brand?.brandAssetId ?? project.brand_asset_id, brand?.assetId ?? null, project.manifest_json);
-    const rendered = await this.renderPreviewArtifacts(project, workDir, sourceFramePath, subjectPath, headlineCard, brand?.path ?? null, composition, sourceFrame, subject, provider);
-    await this.storeManifest(project, rendered.manifest);
-    await this.db.query("UPDATE thumbnail_projects SET segmentation_provider=$2,source_frame_asset_id=$3,subject_asset_id=$4,preview_asset_id=$5,manifest_json=$6::jsonb,status='ready',error=NULL,updated_at=now() WHERE id=$1", [project.id, provider, sourceFrame.id, subject.id, rendered.preview.id, JSON.stringify(rendered.manifest)]);
-    await this.updateProgress(jobId, 90);
-  }
-
-  private async processLayoutUpdate(jobId: string, project: ThumbnailProjectRow, workDir: string) {
-    if (!project.source_frame_asset_id || !project.subject_asset_id) throw new Error('Thumbnail layout update requires existing source and subject assets');
-    const [sourceFramePath, subjectPath] = await Promise.all([
-      this.materializeAsset(project.source_frame_asset_id, join(workDir, 'source-frame')),
-      this.materializeAsset(project.subject_asset_id, join(workDir, 'subject')),
-    ]);
-    await validatePngOutput(subjectPath);
-    const headlineCard = selectedHeadlineCard(project.social_copy, project.source_headline_card_id);
-    const brand = await this.resolveBrandAsset(project.brand_asset_id, workDir);
-    const composition = defaultThumbnailComposition(project, headlineCard, brand?.brandAssetId ?? project.brand_asset_id, brand?.assetId ?? null, project.manifest_json);
-    const rendered = await this.renderPreviewArtifacts(
-      project,
-      workDir,
-      sourceFramePath,
-      subjectPath,
-      headlineCard,
-      brand?.path ?? null,
-      composition,
-      { id: project.source_frame_asset_id, storage_key: `thumbnails/${project.id}/source-frame.jpg` },
-      { id: project.subject_asset_id, storage_key: `thumbnails/${project.id}/subject.png` },
-      project.segmentation_provider,
-    );
-    await this.storeManifest(project, rendered.manifest);
-    await this.db.query("UPDATE thumbnail_projects SET preview_asset_id=$2,export_asset_id=NULL,manifest_json=$3::jsonb,status='ready',error=NULL,updated_at=now() WHERE id=$1", [project.id, rendered.preview.id, JSON.stringify(rendered.manifest)]);
-    await this.updateProgress(jobId, 90);
-  }
-
-  private async renderPreviewArtifacts(
-    project: ThumbnailProjectRow,
-    workDir: string,
-    sourceFramePath: string,
-    subjectPath: string,
-    headlineCard: HeadlineCard | null,
-    logoPath: string | null,
-    composition: ThumbnailComposition,
-    sourceFrame: StoredThumbnailAsset,
-    subject: StoredThumbnailAsset,
-    provider: 'sam3' | 'u2netp',
-  ) {
-    const variantsDir = join(workDir, 'variants');
-    await mkdir(variantsDir, { recursive: true });
-    const variantPaths = new Map<ThumbnailLayoutPreset, string>();
-    const variantAssets: StoredVariantAssets = {};
-    for (const preset of THUMBNAIL_LAYOUT_PRESETS) {
-      const variantPath = join(variantsDir, `${preset}.jpg`);
-      await this.renderComposite(sourceFramePath, subjectPath, logoPath, compositionForPreset(composition, preset), variantPath, 'preview');
-      variantPaths.set(preset, variantPath);
-      variantAssets[preset] = await this.storeFile(project.source_id, project.id, `variants/${preset}.jpg`, variantPath, 'image/jpeg');
+    const composition = compositionFromManifest(project.manifest_json, headlineCard, brand?.brandAssetId ?? project.brand_asset_id);
+    await mkdir(join(workDir, 'variants'), { recursive: true });
+    const variants: ThumbnailVariant[] = [];
+    let previewAssetId: string | null = null;
+    for (const variant of THUMBNAIL_VARIANTS) {
+      const variantPath = variant.layoutPreset === composition.layoutPreset
+        ? previewPath
+        : join(workDir, 'variants', `${variant.layoutPreset}.jpg`);
+      await this.renderComposite(sourceFramePath, subjectPath, brand?.path ?? null, { ...composition, layoutPreset: variant.layoutPreset, backgroundPreset: variant.layoutPreset === composition.layoutPreset ? composition.backgroundPreset : defaultBackgroundForLayout(variant.layoutPreset) }, variantPath, 'preview');
+      const stored = await this.storeFile(project.source_id, project.id, variant.layoutPreset === composition.layoutPreset ? 'preview.jpg' : `variants/${variant.layoutPreset}.jpg`, variantPath, 'image/jpeg');
+      if (variant.layoutPreset === composition.layoutPreset) previewAssetId = stored.id;
+      variants.push({ layoutPreset: variant.layoutPreset, label: variant.label, key: `thumbnails/${project.id}/${variant.layoutPreset === composition.layoutPreset ? 'preview.jpg' : `variants/${variant.layoutPreset}.jpg`}`, assetId: stored.id });
     }
-    const selectedPath = variantPaths.get(composition.layoutPreset) ?? variantPaths.get('original')!;
-    const previewPath = join(workDir, 'preview.jpg');
-    await copyFile(selectedPath, previewPath);
-    const preview = await this.storeFile(project.source_id, project.id, 'preview.jpg', previewPath, 'image/jpeg');
+    if (!previewAssetId) {
+      const fallback = variants.find((variant) => variant.layoutPreset === 'clean_cut') ?? variants[0];
+      previewAssetId = fallback?.assetId ?? null;
+    }
     const manifest = createThumbnailManifest({
       project,
       provider,
       headlineCard,
-      brandAssetId: composition.logo.brandAssetId,
-      brandAssetDbId: composition.logo.assetId,
-      sourceFrameAssetId: sourceFrame.id,
-      subjectAssetId: subject.id,
-      previewAssetId: preview.id,
+      brandAssetId: brand?.brandAssetId ?? project.brand_asset_id,
+      brandAssetDbId: brand?.assetId ?? null,
+      sourceFrameAssetId,
+      subjectAssetId,
+      previewAssetId,
       exportAssetId: project.export_asset_id,
       composition,
-      variantAssets,
+      variants,
       width: this.width,
       height: this.height,
     });
-    return { preview, manifest };
+    await this.storeManifest(project, manifest);
+    await this.db.query("UPDATE thumbnail_projects SET segmentation_provider=$2,source_frame_asset_id=$3,subject_asset_id=$4,preview_asset_id=$5,manifest_json=$6::jsonb,status='ready',error=NULL,updated_at=now() WHERE id=$1", [project.id, provider, sourceFrameAssetId, subjectAssetId, previewAssetId, JSON.stringify(manifest)]);
+    await this.updateProgress(jobId, 90);
   }
 
   private async processExport(jobId: string, project: ThumbnailProjectRow, workDir: string) {
@@ -418,8 +419,8 @@ export class ThumbnailProcessor {
     ]);
     const headlineCard = selectedHeadlineCard(project.social_copy, project.source_headline_card_id);
     const brand = await this.resolveBrandAsset(project.brand_asset_id, workDir);
-    const composition = defaultThumbnailComposition(project, headlineCard, brand?.brandAssetId ?? project.brand_asset_id, brand?.assetId ?? null, project.manifest_json);
     const exportPath = join(workDir, 'export.png');
+    const composition = compositionFromManifest(project.manifest_json, headlineCard, brand?.brandAssetId ?? project.brand_asset_id);
     await this.renderComposite(sourceFramePath, subjectPath, brand?.path ?? null, composition, exportPath, 'export');
     const exported = await this.storeFile(project.source_id, project.id, 'export.png', exportPath, 'image/png');
     const existing = project.manifest_json ?? {};
@@ -434,9 +435,9 @@ export class ThumbnailProcessor {
       subjectAssetId: project.subject_asset_id,
       previewAssetId: project.preview_asset_id,
       exportAssetId: exported.id,
-      composition,
-      variantAssets: manifestVariantAssets(existing),
       createdAt,
+      composition,
+      variants: manifestVariants(project.manifest_json),
       width: this.width,
       height: this.height,
     });
@@ -446,15 +447,14 @@ export class ThumbnailProcessor {
   }
 
   private async segment(project: ThumbnailProjectRow, sourceFramePath: string, outputPath: string) {
-    const input = { sourceFramePath, outputPath, positiveBox: project.positive_box, negativeBoxes: Array.isArray(project.negative_boxes) ? project.negative_boxes : [] };
+    const input = { sourceFramePath, outputPath, positiveBox: project.positive_box, negativeBoxes: Array.isArray(project.negative_boxes) ? project.negative_boxes : [], protectedBoxes: Array.isArray(project.protected_boxes) ? project.protected_boxes : [] };
     return segmentThumbnail(project.segmentation_provider, input, { sam3: this.sam3, u2netp: this.u2netp });
   }
 
   private async renderComposite(sourceFramePath: string, subjectPath: string, logoPath: string | null, composition: ThumbnailComposition, outputPath: string, format: 'preview' | 'export') {
     const args = ['-y', '-i', sourceFramePath, '-i', subjectPath];
-    const includeLogo = Boolean(logoPath && composition.logo.enabled);
-    if (includeLogo) args.push('-i', logoPath!);
-    const filter = buildThumbnailFilter(this.width, this.height, includeLogo, composition);
+    if (logoPath) args.push('-i', logoPath);
+    const filter = buildThumbnailFilter(this.width, this.height, Boolean(logoPath), composition);
     args.push('-filter_complex', filter, '-map', '[out]', '-frames:v', '1');
     if (format === 'preview') args.push('-q:v', '2');
     else args.push('-c:v', 'png');
@@ -504,7 +504,7 @@ export class ThumbnailProcessor {
   }
 
   private async storeManifest(project: ThumbnailProjectRow, manifest: Record<string, unknown>) {
-    const key = `thumbnails/${project.id}/manifest.json`;
+    const key = `thumbnails/${project.id}/thumbnail-manifest.json`;
     const body = Buffer.from(JSON.stringify(manifest, null, 2));
     await this.store.put(key, body);
     await this.insertAsset(project.source_id, key, 'application/json', body.byteLength);
@@ -527,139 +527,116 @@ export class ThumbnailProcessor {
 }
 
 function selectedHeadlineCard(socialCopy: Record<string, unknown>, id: string | null): HeadlineCard | null {
-  if (!id || !Array.isArray(socialCopy.headlineCards)) return null;
+  if (!id) {
+    const headline = typeof socialCopy.headline === 'string' ? socialCopy.headline.trim() : '';
+    return headline ? { id: 'candidate-headline', text: headline, color: null } : null;
+  }
+  if (!Array.isArray(socialCopy.headlineCards)) return null;
   const card = socialCopy.headlineCards.find((value) => value && typeof value === 'object' && (value as { id?: unknown }).id === id) as Record<string, unknown> | undefined;
   if (!card || typeof card.text !== 'string') throw new Error(`Headline card ${id} was not found on the candidate`);
   return { id, text: card.text, color: typeof card.color === 'string' ? card.color : null };
 }
 
-const LAYOUT_DEFAULTS: Record<ThumbnailLayoutPreset, { position: { x: number; y: number }; scale: number; background: ThumbnailComposition['background']['preset'] }> = {
-  original: { position: { x: 0.5, y: 0.52 }, scale: 1, background: 'blurred' },
-  bold_statement: { position: { x: 0.56, y: 0.5 }, scale: 1.06, background: 'dark_blue' },
-  topic_first: { position: { x: 0.62, y: 0.52 }, scale: 0.92, background: 'dark_blue' },
-  quote_hook: { position: { x: 0.52, y: 0.52 }, scale: 1, background: 'black' },
-  data_callout: { position: { x: 0.68, y: 0.52 }, scale: 0.9, background: 'dark_blue' },
-  split_focus: { position: { x: 0.72, y: 0.52 }, scale: 0.86, background: 'white' },
-  clean_cut: { position: { x: 0.5, y: 0.5 }, scale: 1.02, background: 'blurred' },
-};
-
-function defaultThumbnailComposition(
-  project: ThumbnailProjectRow,
-  headlineCard: HeadlineCard | null,
-  brandAssetId: string | null,
-  brandAssetDbId: string | null,
-  existingManifest: Record<string, unknown> | null = null,
-): ThumbnailComposition {
-  const existing = existingManifest?.composition && typeof existingManifest.composition === 'object'
-    ? existingManifest.composition as Record<string, unknown>
-    : {};
-  const preset = typeof existing.layoutPreset === 'string' && THUMBNAIL_LAYOUT_PRESETS.includes(existing.layoutPreset as ThumbnailLayoutPreset)
-    ? existing.layoutPreset as ThumbnailLayoutPreset
-    : 'original';
-  const defaults = LAYOUT_DEFAULTS[preset];
-  const existingSubject = existing.subject && typeof existing.subject === 'object' ? existing.subject as Record<string, unknown> : {};
-  const existingPosition = existingSubject.position && typeof existingSubject.position === 'object' ? existingSubject.position as Record<string, unknown> : {};
-  const existingHeadline = existing.headline && typeof existing.headline === 'object' ? existing.headline as Record<string, unknown> : {};
-  const existingBackground = existing.background && typeof existing.background === 'object' ? existing.background as Record<string, unknown> : {};
-  const existingLogo = existing.logo && typeof existing.logo === 'object' ? existing.logo as Record<string, unknown> : {};
-  const socialHeadline = typeof project.social_copy.headline === 'string' ? project.social_copy.headline : '';
-  const backgroundPreset = typeof existingBackground.preset === 'string' && ['black', 'white', 'dark_blue', 'blurred'].includes(existingBackground.preset)
-    ? existingBackground.preset as ThumbnailComposition['background']['preset']
-    : defaults.background;
-  const logoPosition = typeof existingLogo.position === 'string' && ['top-left', 'top-center', 'top-right', 'center', 'bottom-left', 'bottom-center', 'bottom-right'].includes(existingLogo.position)
-    ? existingLogo.position as ThumbnailComposition['logo']['position']
-    : 'top-left';
-  return {
-    layoutPreset: preset,
-    subject: {
-      position: {
-        x: typeof existingPosition.x === 'number' ? existingPosition.x : defaults.position.x,
-        y: typeof existingPosition.y === 'number' ? existingPosition.y : defaults.position.y,
-      },
-      scale: typeof existingSubject.scale === 'number' && existingSubject.scale > 0 ? existingSubject.scale : defaults.scale,
-    },
-    headline: {
-      text: headlineCard?.text ?? (typeof existingHeadline.text === 'string' ? existingHeadline.text : socialHeadline),
-      sourceCardId: headlineCard?.id ?? (typeof existingHeadline.sourceCardId === 'string' ? existingHeadline.sourceCardId : project.source_headline_card_id),
-    },
-    background: { preset: backgroundPreset },
-    logo: {
-      enabled: typeof existingLogo.enabled === 'boolean' ? existingLogo.enabled : Boolean(brandAssetDbId),
-      brandAssetId: brandAssetId ?? (typeof existingLogo.brandAssetId === 'string' ? existingLogo.brandAssetId : null),
-      assetId: brandAssetDbId ?? (typeof existingLogo.assetId === 'string' ? existingLogo.assetId : null),
-      position: logoPosition,
-    },
-  };
-}
-
-function compositionForPreset(composition: ThumbnailComposition, preset: ThumbnailLayoutPreset): ThumbnailComposition {
-  if (preset === composition.layoutPreset) return composition;
-  const defaults = LAYOUT_DEFAULTS[preset];
-  return {
-    ...composition,
-    layoutPreset: preset,
-    subject: { position: defaults.position, scale: defaults.scale },
-    background: { preset: defaults.background },
-  };
-}
-
-function manifestVariantAssets(manifest: Record<string, unknown>): StoredVariantAssets {
-  const assets = manifest.assets && typeof manifest.assets === 'object' ? manifest.assets as Record<string, unknown> : {};
-  const variants = assets.variants && typeof assets.variants === 'object' ? assets.variants as Record<string, unknown> : {};
-  const output: StoredVariantAssets = {};
-  for (const preset of THUMBNAIL_LAYOUT_PRESETS) {
-    const value = variants[preset];
-    if (!value || typeof value !== 'object') continue;
-    const assetId = (value as { assetId?: unknown }).assetId;
-    const key = (value as { key?: unknown }).key;
-    if (typeof assetId === 'string' && typeof key === 'string') output[preset] = { id: assetId, storage_key: key };
-  }
-  return output;
-}
-
 function buildThumbnailFilter(width: number, height: number, hasLogo: boolean, composition: ThumbnailComposition) {
-  const background = composition.background.preset === 'black'
-    ? `color=c=black:s=${width}x${height}[background]`
-    : composition.background.preset === 'white'
-      ? `color=c=white:s=${width}x${height}[background]`
-      : composition.background.preset === 'dark_blue'
-        ? `color=c=0A2342:s=${width}x${height}[background]`
-        : `[0:v]scale=${width}:${height}:force_original_aspect_ratio=increase,crop=${width}:${height},gblur=sigma=18,eq=brightness=-0.18[background]`;
-  const subjectWidth = Math.round(width * 0.62 * composition.subject.scale);
-  const subjectHeight = Math.round(height * 0.94 * composition.subject.scale);
-  const subjectX = `(W-w)*${composition.subject.position.x.toFixed(4)}`;
-  const subjectY = `(H-h)*${composition.subject.position.y.toFixed(4)}`;
-  const filters = [
-    background,
-    `[1:v]scale=${subjectWidth}:${subjectHeight}:force_original_aspect_ratio=decrease[subject]`,
-    `[background][subject]overlay=x=${subjectX}:y=${subjectY}[scene]`,
-  ];
-  let current = 'scene';
+  const layout = composition.layoutPreset;
+  const isOriginal = layout === 'original' || composition.backgroundPreset === 'source';
+  const backgroundMode = composition.backgroundPreset;
+  const filters = [isOriginal
+    ? `[0:v]scale=${width}:${height}:force_original_aspect_ratio=increase,crop=${width}:${height}[background]`
+    : `${opaqueBackground(width, height, backgroundMode)}[background]`];
+  let current = 'background';
+
+  const subjectScale = Math.max(0.5, Math.min(2, composition.subject.scale));
+  const subjectWidth = (layout === 'split_focus' ? 0.53 : layout === 'original' ? 0.48 : layout === 'minimal_portrait' ? 0.42 : 0.56) * subjectScale;
+  const subjectHeight = (layout === 'split_focus' ? 0.92 : 0.96) * subjectScale;
+  filters.push(`[1:v]scale=${Math.round(width * subjectWidth)}:${Math.round(height * subjectHeight)}:force_original_aspect_ratio=decrease[subject]`);
+  const subjectX = layout === 'original' ? `(W-w)*${clampUnit(composition.subject.position.x)}` : layout === 'split_focus' ? 'W-w-W*0.04' : layout === 'question' ? 'W-w-W*0.03' : 'W-w-W*0.045';
+  const subjectY = layout === 'original' ? `(H-h)*${clampUnit(composition.subject.position.y)}` : 'H-h-H*0.02';
+  filters.push(`[${current}][subject]overlay=x=${subjectX}:y=${subjectY}:eof_action=repeat[scene]`);
+  current = 'scene';
+
   if (hasLogo) {
+    const logo = logoOverlay(composition.logo.position, width, height);
     filters.push(`[2:v]scale=-1:${Math.round(height * 0.09)}[logo]`);
-    const logoCoordinates = {
-      'top-left': `${Math.round(width * 0.04)}:${Math.round(height * 0.05)}`,
-      'top-center': `(W-w)/2:${Math.round(height * 0.05)}`,
-      'top-right': `W-w-${Math.round(width * 0.04)}:${Math.round(height * 0.05)}`,
-      center: `(W-w)/2:(H-h)/2`,
-      'bottom-left': `${Math.round(width * 0.04)}:H-h-${Math.round(height * 0.05)}`,
-      'bottom-center': `(W-w)/2:H-h-${Math.round(height * 0.05)}`,
-      'bottom-right': `W-w-${Math.round(width * 0.04)}:H-h-${Math.round(height * 0.05)}`,
-    }[composition.logo.position];
-    filters.push(`[${current}][logo]overlay=${logoCoordinates}[branded]`);
+    filters.push(`[${current}][logo]overlay=${logo.x}:${logo.y}[branded]`);
     current = 'branded';
   }
-  if (composition.headline.text) {
-    const text = escapeDrawText(composition.headline.text);
-    const lightText = composition.background.preset === 'white' ? 'black' : 'white';
-    const boxColor = composition.background.preset === 'white' ? 'white@0.9' : '0x0A2342@0.92';
-    const headlineY = composition.layoutPreset === 'split_focus' || composition.layoutPreset === 'data_callout' ? 0.07 : 0.68;
-    const headlineHeight = headlineY < 0.2 ? 0.25 : 0.25;
-    filters.push(`[${current}]drawbox=x=${Math.round(width * 0.05)}:y=${Math.round(height * headlineY)}:w=${Math.round(width * 0.9)}:h=${Math.round(height * headlineHeight)}:color=${boxColor}:t=fill,drawtext=text='${text}':fontcolor=${lightText}:fontsize=${Math.round(height * 0.075)}:x=(w-text_w)/2:y=${Math.round(height * (headlineY + 0.055))}[out]`);
+
+  const headline = composition.headline.text.trim();
+  if (headline) {
+    const text = escapeDrawText(wrapHeadline(headline, layout));
+    const lightText = backgroundMode === 'white' || backgroundMode === 'gradient_white_blue' || layout === 'split_focus' || layout === 'question';
+    const textColor = lightText ? '0x101624' : 'white';
+    const boxed = layout === 'original' || layout === 'split_focus' || layout === 'question';
+    const boxColor = lightText ? 'white' : '0x0A2342';
+    const x = layout === 'original' || layout === 'split_focus' || layout === 'question' ? Math.round(width * 0.05) : Math.round(width * 0.06);
+    const y = layout === 'original' ? Math.round(height * 0.68) : layout === 'split_focus' || layout === 'question' ? Math.round(height * 0.16) : Math.round(height * 0.12);
+    const boxWidth = layout === 'original' ? Math.round(width * 0.88) : layout === 'split_focus' || layout === 'question' ? Math.round(width * 0.46) : Math.round(width * 0.44);
+    const boxHeight = layout === 'original' ? Math.round(height * 0.24) : Math.round(height * 0.28);
+    const fontSize = Math.max(28, Math.min(112, Math.round(height * (composition.headline.size / 1000))));
+    const alignX = composition.headline.alignment === 'center' ? `(w-text_w)/2` : composition.headline.alignment === 'right' ? `w-text_w-${Math.round(width * 0.05)}` : x + Math.round(width * 0.02);
+    const fontFile = process.env.NB_INTERNATIONAL_FONT_FILE ? `fontfile='${escapeFilterPath(process.env.NB_INTERNATIONAL_FONT_FILE)}':` : '';
+    const layoutAccent = layout === 'framed_insight' ? `,drawbox=x=${Math.round(width * 0.7)}:y=${Math.round(height * 0.08)}:w=${Math.round(width * 0.25)}:h=${Math.round(height * 0.84)}:color=0x3B6BE3@0.95:t=18` : '';
+    const questionMark = layout === 'question' ? `,drawtext=${fontFile}text='?':fontcolor=0x3B6BE3:fontsize=${Math.round(height * 0.7)}:x=${Math.round(width * 0.68)}:y=${Math.round(height * 0.15)}` : '';
+    const box = boxed ? `drawbox=x=${x}:y=${y}:w=${boxWidth}:h=${boxHeight}:color=${boxColor}:t=fill,` : '';
+    filters.push(`[${current}]${box}drawtext=${fontFile}text='${text}':fontcolor=${textColor}:fontsize=${fontSize}:x=${alignX}:y=${y + Math.round(height * 0.055)}:line_spacing=4${layoutAccent}${questionMark}[out]`);
   } else {
     filters.push(`[${current}]null[out]`);
   }
   return filters.join(';');
+}
+
+function opaqueBackground(width: number, height: number, preset: ThumbnailBackgroundPreset) {
+  const solid = ({ dark_blue: '0x102143', black: '0x05070A', white: '0xF7F8FA' } as Partial<Record<ThumbnailBackgroundPreset, string>>)[preset];
+  if (solid) return `color=c=${solid}:s=${width}x${height}`;
+  const gradients: Record<string, { r: string; g: string; b: string }> = {
+    gradient_blue: { r: '20+35*X/W', g: '54+75*Y/H', b: '150+95*X/W' },
+    gradient_cobalt: { r: '10+30*Y/H', g: '35+75*X/W', b: '105+125*Y/H' },
+    gradient_royal: { r: '38+85*Y/H', g: '25+35*X/W', b: '120+105*X/W' },
+    gradient_dark: { r: '5+20*X/W', g: '12+25*Y/H', b: '30+45*X/W' },
+    gradient_white_blue: { r: '248-18*X/W', g: '250-22*X/W', b: '252-35*Y/H' },
+  };
+  const gradient = gradients[preset] ?? gradients.gradient_blue;
+  return `color=c=black:s=${width}x${height},geq=r='${gradient.r}':g='${gradient.g}':b='${gradient.b}'`;
+}
+
+function defaultBackgroundForLayout(layout: ThumbnailLayoutPreset): ThumbnailBackgroundPreset {
+  if (layout === 'original') return 'source';
+  if (layout === 'split_focus' || layout === 'question') return 'gradient_white_blue';
+  if (layout === 'topic_first' || layout === 'data_callout' || layout === 'behind_numbers') return 'gradient_cobalt';
+  if (layout === 'event_stage' || layout === 'motion_gradient') return 'gradient_royal';
+  if (layout === 'minimal_portrait') return 'gradient_dark';
+  return 'gradient_blue';
+}
+
+function wrapHeadline(value: string, layout: ThumbnailLayoutPreset) {
+  const limit = layout === 'original' ? 34 : layout === 'question' || layout === 'split_focus' ? 22 : 19;
+  const words = value.trim().split(/\s+/).filter(Boolean);
+  const lines: string[] = [];
+  let line = '';
+  for (const word of words) {
+    const next = line ? `${line} ${word}` : word;
+    if (line && next.length > limit) {
+      lines.push(line);
+      line = word;
+    } else line = next;
+  }
+  if (line) lines.push(line);
+  return lines.slice(0, 5).join('\n');
+}
+
+function clampUnit(value: number) {
+  return Math.max(0, Math.min(1, value));
+}
+
+function logoOverlay(position: ThumbnailComposition['logo']['position'], width: number, height: number) {
+  const x = position.endsWith('left') ? Math.round(width * 0.04) : position.endsWith('right') ? `W-w-${Math.round(width * 0.04)}` : '(W-w)/2';
+  const y = position.startsWith('top') ? Math.round(height * 0.05) : position.startsWith('bottom') ? `H-h-${Math.round(height * 0.05)}` : '(H-h)/2';
+  return { x, y };
+}
+
+function escapeFilterPath(value: string) {
+  return value.replace(/\\/g, '\\\\').replace(/'/g, "\\'").replace(/:/g, '\\:');
 }
 
 function escapeDrawText(value: string) {
@@ -672,26 +649,6 @@ function sidecarEndpoint(baseUrl: string) {
   return url.toString();
 }
 
-async function validateSidecarFile(filePath: string, field: 'subjectPngPath' | 'maskPath') {
-  try {
-    const details = await stat(filePath);
-    if (!details.isFile()) throw new Error('path is not a regular file');
-  } catch (error) {
-    const reason = error instanceof Error ? `: ${error.message}` : '';
-    throw new Error(`SAM3 sidecar response ${field} is invalid (${filePath})${reason}`, { cause: error });
-  }
-}
-
-async function validatePngOutput(filePath: string) {
-  try {
-    const header = await readFile(filePath, { encoding: null });
-    const signature = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
-    if (header.length < signature.length || !signature.every((value, index) => header[index] === value)) throw new Error('file is not a PNG');
-  } catch (error) {
-    const reason = error instanceof Error ? `: ${error.message}` : '';
-    throw new Error(`Thumbnail subject output is invalid (${filePath})${reason}`, { cause: error });
-  }
-}
 function runCommand(command: string, args: string[]) {
   return new Promise<void>((resolve, reject) => {
     const child = spawn(command, args, { stdio: ['ignore', 'ignore', 'pipe'] });

@@ -3,7 +3,7 @@ import multipart from '@fastify/multipart';
 import pg from 'pg';
 import { randomUUID } from 'node:crypto';
 import { Readable } from 'node:stream';
-import { AudienceMomentSchema, AudienceSignalSchema, BrandAssetSchema, CandidateSchema, CreateJobSchema, CreateRenderSchema, CreateSourceSchema, JobSchema, ProbeSchema, RenderSchema, ThumbnailCreateSchema, ThumbnailJobSchema, ThumbnailProjectSchema, TranscriptSchema, UpdateCandidateSchema, YouTubeChannelSchema, YouTubeIngestRequestSchema, YouTubeSyncRequestSchema, YouTubeVideoSchema } from '@clipper/contracts';
+import { AudienceMomentSchema, AudienceSignalSchema, BrandAssetSchema, CandidateSchema, CreateJobSchema, CreateRenderSchema, CreateSourceSchema, JobSchema, ProbeSchema, RenderSchema, ThumbnailCreateSchema, ThumbnailJobSchema, ThumbnailProjectSchema, ThumbnailUpdateSchema, TranscriptSchema, UpdateCandidateSchema, YouTubeChannelSchema, YouTubeIngestRequestSchema, YouTubeSyncRequestSchema, YouTubeVideoSchema } from '@clipper/contracts';
 import { AssetStore, type MultipartAssetStore } from '@clipper/storage';
 import { z, ZodError } from 'zod';
 import { YouTubeCatalogSync, YouTubeDataApiClient, YouTubeSyncError } from './youtube-sync.js';
@@ -179,6 +179,7 @@ const toThumbnailProject = (row: Record<string, any>) => ThumbnailProjectSchema.
   segmentationProvider: row.segmentation_provider,
   positiveBox: row.positive_box ?? null,
   negativeBoxes: Array.isArray(row.negative_boxes) ? row.negative_boxes : [],
+  protectedBoxes: Array.isArray(row.protected_boxes) ? row.protected_boxes : [],
   manifest: row.manifest_json ?? null,
   sourceFrameAssetId: row.source_frame_asset_id ?? null,
   subjectAssetId: row.subject_asset_id ?? null,
@@ -212,34 +213,6 @@ function candidateHasHeadlineCard(socialCopy: unknown, headlineCardId: string | 
   if (!socialCopy || typeof socialCopy !== 'object') return false;
   const headlineCards = (socialCopy as { headlineCards?: unknown }).headlineCards;
   return Array.isArray(headlineCards) && headlineCards.some((card) => card && typeof card === 'object' && (card as { id?: unknown }).id === headlineCardId);
-}
-
-function mergeThumbnailManifestComposition(manifest: Record<string, unknown> | null, update: unknown) {
-  if (!manifest || !update || typeof update !== 'object') return manifest;
-  const current = manifest.composition && typeof manifest.composition === 'object' ? manifest.composition as Record<string, any> : {};
-  const next = update as Record<string, any>;
-  const presetDefaults: Record<string, { position: { x: number; y: number }; scale: number; background: string }> = {
-    original: { position: { x: 0.5, y: 0.52 }, scale: 1, background: 'blurred' },
-    bold_statement: { position: { x: 0.56, y: 0.5 }, scale: 1.06, background: 'dark_blue' },
-    topic_first: { position: { x: 0.62, y: 0.52 }, scale: 0.92, background: 'dark_blue' },
-    quote_hook: { position: { x: 0.52, y: 0.52 }, scale: 1, background: 'black' },
-    data_callout: { position: { x: 0.68, y: 0.52 }, scale: 0.9, background: 'dark_blue' },
-    split_focus: { position: { x: 0.72, y: 0.52 }, scale: 0.86, background: 'white' },
-    clean_cut: { position: { x: 0.5, y: 0.5 }, scale: 1.02, background: 'blurred' },
-  };
-  const preset = typeof next.layoutPreset === 'string' ? presetDefaults[next.layoutPreset] : undefined;
-  const layoutChanged = Boolean(preset && next.layoutPreset !== current.layoutPreset);
-  return {
-    ...manifest,
-    composition: {
-      ...current,
-      ...next,
-      subject: { ...(layoutChanged ? { position: preset!.position, scale: preset!.scale } : (current.subject ?? {})), ...(next.subject ?? {}) },
-      headline: { ...(current.headline ?? {}), ...(next.headline ?? {}) },
-      background: { ...(layoutChanged ? { preset: preset!.background } : (current.background ?? {})), ...(next.background ?? {}) },
-      logo: { ...(current.logo ?? {}), ...(next.logo ?? {}) },
-    },
-  };
 }
 
 type AudienceRetentionRow = {
@@ -1159,10 +1132,10 @@ export function buildApp(db: pg.Pool, store: AssetStore, maxUploadBytes = 5_000_
     try {
       await client.query('BEGIN');
       const project = await client.query(`
-        INSERT INTO thumbnail_projects(candidate_id,source_id,frame_seconds,source_headline_card_id,brand_asset_id,segmentation_provider,positive_box,negative_boxes)
-        VALUES($1,$2,$3,$4,$5,$6,$7::jsonb,$8::jsonb)
+        INSERT INTO thumbnail_projects(candidate_id,source_id,frame_seconds,source_headline_card_id,brand_asset_id,segmentation_provider,positive_box,negative_boxes,protected_boxes)
+        VALUES($1,$2,$3,$4,$5,$6,$7::jsonb,$8::jsonb,$9::jsonb)
         RETURNING *
-      `, [candidateId, candidateRow.source_id, frameSeconds, input.sourceHeadlineCardId, input.brandAssetId, segmentationProvider, input.positiveBox ? JSON.stringify(input.positiveBox) : null, JSON.stringify(input.negativeBoxes)]);
+      `, [candidateId, candidateRow.source_id, frameSeconds, input.sourceHeadlineCardId, input.brandAssetId, segmentationProvider, input.positiveBox ? JSON.stringify(input.positiveBox) : null, JSON.stringify(input.negativeBoxes), JSON.stringify(input.protectedBoxes)]);
       const job = await client.query('INSERT INTO thumbnail_jobs(thumbnail_project_id) VALUES($1) RETURNING *', [project.rows[0].id]);
       await client.query('COMMIT');
       return reply.code(201).send({ project: toThumbnailProject(project.rows[0]), job: toThumbnailJob(job.rows[0]) });
@@ -1184,7 +1157,7 @@ export function buildApp(db: pg.Pool, store: AssetStore, maxUploadBytes = 5_000_
 
   app.patch('/v1/thumbnails/:thumbnailId', async (request, reply) => {
     const { thumbnailId } = request.params as { thumbnailId: string };
-    const input = ThumbnailCreateSchema.partial().parse(request.body ?? {});
+    const input = ThumbnailUpdateSchema.parse(request.body ?? {});
     if (!Object.keys(input).length) return reply.code(400).send({ error: 'thumbnail_update_required' });
     const current = await db.query(`
       SELECT project.*,candidate.social_copy,probe.duration_seconds
@@ -1208,35 +1181,52 @@ export function buildApp(db: pg.Pool, store: AssetStore, maxUploadBytes = 5_000_
     }
     const positiveBox = input.positiveBox === undefined ? row.positive_box : input.positiveBox;
     const negativeBoxes = input.negativeBoxes === undefined ? row.negative_boxes : input.negativeBoxes;
+    const protectedBoxes = input.protectedBoxes === undefined ? row.protected_boxes : input.protectedBoxes;
     const segmentationProvider = input.segmentationProvider
       ?? (input.positiveBox !== undefined ? (positiveBox ? 'sam3' : 'u2netp') : row.segmentation_provider);
     if (segmentationProvider === 'sam3' && !positiveBox) return reply.code(400).send({ error: 'sam3_positive_box_required' });
-    const segmentationChanged = input.frameSeconds !== undefined || input.positiveBox !== undefined || input.negativeBoxes !== undefined || input.segmentationProvider !== undefined;
-    const canReuseCutout = !segmentationChanged && Boolean(row.source_frame_asset_id && row.subject_asset_id && row.manifest_json);
-    const nextManifest = canReuseCutout
-      ? mergeThumbnailManifestComposition(row.manifest_json, input.composition)
-      : null;
+    const rebuildSubject = input.frameSeconds !== undefined
+      || input.positiveBox !== undefined
+      || input.negativeBoxes !== undefined
+      || input.protectedBoxes !== undefined
+      || input.segmentationProvider !== undefined;
+    const compositionChanged = rebuildSubject
+      || input.manifest !== undefined
+      || input.sourceHeadlineCardId !== undefined
+      || input.brandAssetId !== undefined;
+    const manifestJson = input.manifest ?? (rebuildSubject ? null : row.manifest_json);
+    const sourceFrameAssetId = rebuildSubject ? null : row.source_frame_asset_id;
+    const subjectAssetId = rebuildSubject ? null : row.subject_asset_id;
+    const previewAssetId = rebuildSubject ? null : row.preview_asset_id;
+    const exportAssetId = compositionChanged ? null : row.export_asset_id;
 
     const client = await db.connect();
     try {
       await client.query('BEGIN');
       await client.query("UPDATE thumbnail_jobs SET status='cancelled',lease_expires_at=NULL,updated_at=now() WHERE thumbnail_project_id=$1 AND status='queued'", [thumbnailId]);
-      const project = canReuseCutout
-        ? await client.query(`
-          UPDATE thumbnail_projects
-          SET frame_seconds=$2,source_headline_card_id=$3,brand_asset_id=$4,segmentation_provider=$5,
-            positive_box=$6::jsonb,negative_boxes=$7::jsonb,manifest_json=$8::jsonb,export_asset_id=NULL,status='queued',error=NULL,updated_at=now()
-          WHERE id=$1
-          RETURNING *
-        `, [thumbnailId, frameSeconds, sourceHeadlineCardId, brandAssetId, segmentationProvider, positiveBox ? JSON.stringify(positiveBox) : null, JSON.stringify(negativeBoxes), JSON.stringify(nextManifest)])
-        : await client.query(`
-          UPDATE thumbnail_projects
-          SET frame_seconds=$2,source_headline_card_id=$3,brand_asset_id=$4,segmentation_provider=$5,
-            positive_box=$6::jsonb,negative_boxes=$7::jsonb,manifest_json=NULL,source_frame_asset_id=NULL,
-            subject_asset_id=NULL,preview_asset_id=NULL,export_asset_id=NULL,status='queued',error=NULL,updated_at=now()
-          WHERE id=$1
-          RETURNING *
-        `, [thumbnailId, frameSeconds, sourceHeadlineCardId, brandAssetId, segmentationProvider, positiveBox ? JSON.stringify(positiveBox) : null, JSON.stringify(negativeBoxes)]);
+      const project = await client.query(`
+        UPDATE thumbnail_projects
+        SET frame_seconds=$2,source_headline_card_id=$3,brand_asset_id=$4,segmentation_provider=$5,
+          positive_box=$6::jsonb,negative_boxes=$7::jsonb,protected_boxes=$8::jsonb,manifest_json=$9::jsonb,
+          source_frame_asset_id=$10,subject_asset_id=$11,preview_asset_id=$12,export_asset_id=$13,
+          status='queued',error=NULL,updated_at=now()
+        WHERE id=$1
+        RETURNING *
+      `, [
+        thumbnailId,
+        frameSeconds,
+        sourceHeadlineCardId,
+        brandAssetId,
+        segmentationProvider,
+        positiveBox ? JSON.stringify(positiveBox) : null,
+        JSON.stringify(negativeBoxes),
+        JSON.stringify(protectedBoxes),
+        manifestJson ? JSON.stringify(manifestJson) : null,
+        sourceFrameAssetId,
+        subjectAssetId,
+        previewAssetId,
+        exportAssetId,
+      ]);
       const job = await client.query('INSERT INTO thumbnail_jobs(thumbnail_project_id) VALUES($1) RETURNING *', [thumbnailId]);
       await client.query('COMMIT');
       return { project: toThumbnailProject(project.rows[0]), job: toThumbnailJob(job.rows[0]) };
