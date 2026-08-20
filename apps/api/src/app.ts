@@ -169,6 +169,129 @@ const toRender = (row: Record<string, any>) => RenderSchema.parse({
   completedAt: row.completed_at?.toISOString?.() ?? null,
 });
 
+const THUMBNAIL_LAYOUT_LABELS: Record<string, string> = {
+  original: 'Original frame',
+  bold_statement: 'Bold statement',
+  topic_first: 'Topic first',
+  quote_hook: 'Quote hook',
+  data_callout: 'Data callout',
+  split_focus: 'Split focus',
+  clean_cut: 'Clean cut',
+  behind_numbers: 'Behind the numbers',
+  question: 'The question',
+  event_stage: 'Event / stage',
+  minimal_portrait: 'Minimal portrait',
+  motion_gradient: 'Motion gradient',
+  framed_insight: 'Framed insight',
+};
+const THUMBNAIL_LAYOUT_PRESETS = new Set(Object.keys(THUMBNAIL_LAYOUT_LABELS));
+const THUMBNAIL_BACKGROUND_PRESETS = new Set(['source', 'dark_blue', 'black', 'white', 'gradient_blue', 'gradient_cobalt', 'gradient_royal', 'gradient_dark', 'gradient_white_blue']);
+const THUMBNAIL_LOGO_POSITIONS = new Set(['top-left', 'top-center', 'top-right', 'center', 'bottom-left', 'bottom-center', 'bottom-right']);
+
+function finiteNumber(value: unknown, fallback: number) {
+  return typeof value === 'number' && Number.isFinite(value) ? value : fallback;
+}
+
+function clamp(value: number, min: number, max: number) {
+  return Math.max(min, Math.min(max, value));
+}
+
+/**
+ * Thumbnail manifests written by the first backend release used
+ * composition.headline.text, composition.background.preset, and a keyed
+ * assets.variants object. The current contract uses resolved headline data,
+ * backgroundPreset, and a top-level variants array. Normalize on read so old
+ * completed jobs remain editable after the worker/API rollout.
+ */
+export function normalizeThumbnailManifest(value: unknown): Record<string, unknown> | null {
+  if (!value || typeof value !== 'object') return null;
+  const raw = value as Record<string, any>;
+  const headlineCard = raw.headlineCard && typeof raw.headlineCard === 'object' ? raw.headlineCard as Record<string, any> : null;
+  const branding = raw.branding && typeof raw.branding === 'object' ? raw.branding as Record<string, any> : {};
+  const oldComposition = raw.composition && typeof raw.composition === 'object' ? raw.composition as Record<string, any> : {};
+  const oldSubject = oldComposition.subject && typeof oldComposition.subject === 'object' ? oldComposition.subject as Record<string, any> : {};
+  const oldPosition = oldSubject.position && typeof oldSubject.position === 'object' ? oldSubject.position as Record<string, any> : {};
+  const oldHeadline = oldComposition.headline && typeof oldComposition.headline === 'object' ? oldComposition.headline as Record<string, any> : {};
+  const oldBackground = oldComposition.background && typeof oldComposition.background === 'object' ? oldComposition.background as Record<string, any> : {};
+  const oldLogo = oldComposition.logo && typeof oldComposition.logo === 'object' ? oldComposition.logo as Record<string, any> : {};
+  const headlineFallback = typeof headlineCard?.text === 'string' ? headlineCard.text : '';
+  const layoutPreset = THUMBNAIL_LAYOUT_PRESETS.has(oldComposition.layoutPreset) ? oldComposition.layoutPreset : 'clean_cut';
+  const rawBackground = oldComposition.backgroundPreset ?? oldBackground.preset;
+  const backgroundPreset = rawBackground === 'blurred'
+    ? 'source'
+    : THUMBNAIL_BACKGROUND_PRESETS.has(rawBackground)
+      ? rawBackground
+      : 'gradient_blue';
+  const alignment = oldHeadline.alignment === 'center' || oldHeadline.alignment === 'right' ? oldHeadline.alignment : 'left';
+  const logoPosition = THUMBNAIL_LOGO_POSITIONS.has(oldLogo.position) ? oldLogo.position : 'top-left';
+  const resolvedText = typeof oldHeadline.resolvedText === 'string'
+    ? oldHeadline.resolvedText
+    : typeof oldHeadline.text === 'string'
+      ? oldHeadline.text
+      : headlineFallback;
+  const composition = {
+    layoutPreset,
+    subject: {
+      position: {
+        x: clamp(finiteNumber(oldPosition.x, 0.5), 0, 1),
+        y: clamp(finiteNumber(oldPosition.y, 0.5), 0, 1),
+      },
+      scale: clamp(finiteNumber(oldSubject.scale, 1), 0.5, 2),
+    },
+    headline: {
+      sourceCardId: typeof oldHeadline.sourceCardId === 'string' ? oldHeadline.sourceCardId : (typeof headlineCard?.id === 'string' ? headlineCard.id : null),
+      resolvedText,
+      text: typeof oldHeadline.text === 'string' ? oldHeadline.text : resolvedText,
+      size: clamp(finiteNumber(oldHeadline.size, 64), 28, 120),
+      alignment,
+    },
+    backgroundPreset,
+    logo: {
+      brandAssetId: typeof oldLogo.brandAssetId === 'string' ? oldLogo.brandAssetId : (typeof branding.brandAssetId === 'string' ? branding.brandAssetId : null),
+      position: logoPosition,
+    },
+  };
+
+  const assets = raw.assets && typeof raw.assets === 'object' ? raw.assets as Record<string, any> : {};
+  const legacyVariants = assets.variants && typeof assets.variants === 'object' ? assets.variants as Record<string, any> : null;
+  const currentVariants = Array.isArray(raw.variants) ? raw.variants as Array<Record<string, any>> : [];
+  const variants = legacyVariants
+    ? Object.entries(legacyVariants).flatMap(([preset, item]) => {
+        if (!THUMBNAIL_LAYOUT_PRESETS.has(preset) || !item || typeof item !== 'object') return [];
+        return [{
+          layoutPreset: preset,
+          label: THUMBNAIL_LAYOUT_LABELS[preset],
+          key: typeof item.key === 'string' ? item.key : `thumbnails/${raw.projectId}/variants/${preset}.jpg`,
+          assetId: typeof item.assetId === 'string' ? item.assetId : null,
+        }];
+      })
+    : currentVariants.length > 0
+      ? currentVariants.filter((item) => item && THUMBNAIL_LAYOUT_PRESETS.has(item.layoutPreset)).map((item) => ({
+          layoutPreset: item.layoutPreset,
+          label: typeof item.label === 'string' && item.label ? item.label : THUMBNAIL_LAYOUT_LABELS[item.layoutPreset],
+          key: typeof item.key === 'string' ? item.key : `thumbnails/${raw.projectId}/variants/${item.layoutPreset}.jpg`,
+          assetId: typeof item.assetId === 'string' ? item.assetId : null,
+        }))
+      : [];
+
+  return {
+    ...raw,
+    segmentation: {
+      ...(raw.segmentation && typeof raw.segmentation === 'object' ? raw.segmentation : {}),
+      protectedBoxes: Array.isArray(raw.segmentation?.protectedBoxes) ? raw.segmentation.protectedBoxes : [],
+    },
+    composition,
+    variants,
+    assets: {
+      ...assets,
+      manifest: {
+        ...(assets.manifest && typeof assets.manifest === 'object' ? assets.manifest : {}),
+        key: typeof assets.manifest?.key === 'string' ? assets.manifest.key : `thumbnails/${raw.projectId}/thumbnail-manifest.json`,
+      },
+    },
+  };
+}
+
 const toThumbnailProject = (row: Record<string, any>) => ThumbnailProjectSchema.parse({
   id: row.id,
   candidateId: row.candidate_id,
@@ -180,7 +303,7 @@ const toThumbnailProject = (row: Record<string, any>) => ThumbnailProjectSchema.
   positiveBox: row.positive_box ?? null,
   negativeBoxes: Array.isArray(row.negative_boxes) ? row.negative_boxes : [],
   protectedBoxes: Array.isArray(row.protected_boxes) ? row.protected_boxes : [],
-  manifest: row.manifest_json ?? null,
+  manifest: normalizeThumbnailManifest(row.manifest_json),
   sourceFrameAssetId: row.source_frame_asset_id ?? null,
   subjectAssetId: row.subject_asset_id ?? null,
   previewAssetId: row.preview_asset_id ?? null,

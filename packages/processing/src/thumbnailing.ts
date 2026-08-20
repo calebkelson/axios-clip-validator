@@ -201,6 +201,43 @@ function compositionFromManifest(manifest: Record<string, unknown> | null, headl
   if (raw && typeof raw === 'object') {
     const value = raw as Partial<ThumbnailComposition>;
     if (typeof value.layoutPreset === 'string' && value.subject && value.headline && typeof value.backgroundPreset === 'string' && value.logo) return value as ThumbnailComposition;
+    const legacy = raw as Record<string, any>;
+    const legacyHeadline = legacy.headline && typeof legacy.headline === 'object' ? legacy.headline as Record<string, any> : {};
+    const legacySubject = legacy.subject && typeof legacy.subject === 'object' ? legacy.subject as Record<string, any> : {};
+    const legacyPosition = legacySubject.position && typeof legacySubject.position === 'object' ? legacySubject.position as Record<string, any> : {};
+    const legacyBackground = legacy.background && typeof legacy.background === 'object' ? legacy.background as Record<string, any> : {};
+    const legacyLogo = legacy.logo && typeof legacy.logo === 'object' ? legacy.logo as Record<string, any> : {};
+    const layoutPreset = THUMBNAIL_VARIANTS.some((variant) => variant.layoutPreset === legacy.layoutPreset) ? legacy.layoutPreset as ThumbnailLayoutPreset : 'clean_cut';
+    const backgroundPreset = legacyBackground.preset === 'blurred'
+      ? 'source'
+      : ['source', 'dark_blue', 'black', 'white', 'gradient_blue', 'gradient_cobalt', 'gradient_royal', 'gradient_dark', 'gradient_white_blue'].includes(legacyBackground.preset)
+        ? legacyBackground.preset as ThumbnailBackgroundPreset
+        : 'gradient_blue';
+    const alignment = legacyHeadline.alignment === 'center' || legacyHeadline.alignment === 'right' ? legacyHeadline.alignment : 'left';
+    const resolvedText = typeof legacyHeadline.resolvedText === 'string'
+      ? legacyHeadline.resolvedText
+      : typeof legacyHeadline.text === 'string'
+        ? legacyHeadline.text
+        : headlineText(headlineCard);
+    return {
+      layoutPreset,
+      subject: {
+        position: { x: clampUnitWithFallback(Number(legacyPosition.x), 0.5), y: clampUnitWithFallback(Number(legacyPosition.y), 0.5) },
+        scale: clampNumber(Number(legacySubject.scale), 0.5, 2, 1),
+      },
+      headline: {
+        sourceCardId: typeof legacyHeadline.sourceCardId === 'string' ? legacyHeadline.sourceCardId : headlineCard?.id ?? null,
+        resolvedText,
+        text: typeof legacyHeadline.text === 'string' ? legacyHeadline.text : resolvedText,
+        size: clampNumber(Number(legacyHeadline.size), 28, 120, 64),
+        alignment,
+      },
+      backgroundPreset,
+      logo: {
+        brandAssetId: typeof legacyLogo.brandAssetId === 'string' ? legacyLogo.brandAssetId : brandAssetId,
+        position: ['top-left', 'top-center', 'top-right', 'center', 'bottom-left', 'bottom-center', 'bottom-right'].includes(legacyLogo.position) ? legacyLogo.position : 'top-left',
+      },
+    };
   }
   return {
     layoutPreset: 'clean_cut',
@@ -216,8 +253,32 @@ function headlineText(headlineCard: HeadlineCard | null) {
 }
 
 function manifestVariants(manifest: Record<string, unknown> | null): ThumbnailVariant[] {
+  const assets = manifest?.assets;
+  if (assets && typeof assets === 'object') {
+    const legacyVariants = (assets as Record<string, unknown>).variants;
+    if (legacyVariants && typeof legacyVariants === 'object' && !Array.isArray(legacyVariants)) {
+      return Object.entries(legacyVariants as Record<string, any>).flatMap(([layoutPreset, item]) => {
+        if (!THUMBNAIL_VARIANTS.some((variant) => variant.layoutPreset === layoutPreset) || !item || typeof item !== 'object') return [];
+        const variant = THUMBNAIL_VARIANTS.find((candidate) => candidate.layoutPreset === layoutPreset);
+        return [{
+          layoutPreset: layoutPreset as ThumbnailLayoutPreset,
+          label: variant?.label ?? layoutPreset,
+          key: typeof item.key === 'string' ? item.key : `thumbnails/${manifest?.projectId ?? 'project'}/variants/${layoutPreset}.jpg`,
+          assetId: typeof item.assetId === 'string' ? item.assetId : null,
+        }];
+      });
+    }
+  }
   const variants = manifest?.variants;
   return Array.isArray(variants) ? variants as ThumbnailVariant[] : [];
+}
+
+function clampUnitWithFallback(value: number, fallback: number) {
+  return Number.isFinite(value) ? Math.max(0, Math.min(1, value)) : fallback;
+}
+
+function clampNumber(value: number, min: number, max: number, fallback: number) {
+  return Number.isFinite(value) ? Math.max(min, Math.min(max, value)) : fallback;
 }
 
 export function buildExactFrameExtractionArgs(sourcePath: string, frameSeconds: number, outputPath: string) {
