@@ -214,6 +214,34 @@ function candidateHasHeadlineCard(socialCopy: unknown, headlineCardId: string | 
   return Array.isArray(headlineCards) && headlineCards.some((card) => card && typeof card === 'object' && (card as { id?: unknown }).id === headlineCardId);
 }
 
+function mergeThumbnailManifestComposition(manifest: Record<string, unknown> | null, update: unknown) {
+  if (!manifest || !update || typeof update !== 'object') return manifest;
+  const current = manifest.composition && typeof manifest.composition === 'object' ? manifest.composition as Record<string, any> : {};
+  const next = update as Record<string, any>;
+  const presetDefaults: Record<string, { position: { x: number; y: number }; scale: number; background: string }> = {
+    original: { position: { x: 0.5, y: 0.52 }, scale: 1, background: 'blurred' },
+    bold_statement: { position: { x: 0.56, y: 0.5 }, scale: 1.06, background: 'dark_blue' },
+    topic_first: { position: { x: 0.62, y: 0.52 }, scale: 0.92, background: 'dark_blue' },
+    quote_hook: { position: { x: 0.52, y: 0.52 }, scale: 1, background: 'black' },
+    data_callout: { position: { x: 0.68, y: 0.52 }, scale: 0.9, background: 'dark_blue' },
+    split_focus: { position: { x: 0.72, y: 0.52 }, scale: 0.86, background: 'white' },
+    clean_cut: { position: { x: 0.5, y: 0.5 }, scale: 1.02, background: 'blurred' },
+  };
+  const preset = typeof next.layoutPreset === 'string' ? presetDefaults[next.layoutPreset] : undefined;
+  const layoutChanged = Boolean(preset && next.layoutPreset !== current.layoutPreset);
+  return {
+    ...manifest,
+    composition: {
+      ...current,
+      ...next,
+      subject: { ...(layoutChanged ? { position: preset!.position, scale: preset!.scale } : (current.subject ?? {})), ...(next.subject ?? {}) },
+      headline: { ...(current.headline ?? {}), ...(next.headline ?? {}) },
+      background: { ...(layoutChanged ? { preset: preset!.background } : (current.background ?? {})), ...(next.background ?? {}) },
+      logo: { ...(current.logo ?? {}), ...(next.logo ?? {}) },
+    },
+  };
+}
+
 type AudienceRetentionRow = {
   segment_start_seconds: number | string;
   segment_end_seconds: number | string;
@@ -1183,19 +1211,32 @@ export function buildApp(db: pg.Pool, store: AssetStore, maxUploadBytes = 5_000_
     const segmentationProvider = input.segmentationProvider
       ?? (input.positiveBox !== undefined ? (positiveBox ? 'sam3' : 'u2netp') : row.segmentation_provider);
     if (segmentationProvider === 'sam3' && !positiveBox) return reply.code(400).send({ error: 'sam3_positive_box_required' });
+    const segmentationChanged = input.frameSeconds !== undefined || input.positiveBox !== undefined || input.negativeBoxes !== undefined || input.segmentationProvider !== undefined;
+    const canReuseCutout = !segmentationChanged && Boolean(row.source_frame_asset_id && row.subject_asset_id && row.manifest_json);
+    const nextManifest = canReuseCutout
+      ? mergeThumbnailManifestComposition(row.manifest_json, input.composition)
+      : null;
 
     const client = await db.connect();
     try {
       await client.query('BEGIN');
       await client.query("UPDATE thumbnail_jobs SET status='cancelled',lease_expires_at=NULL,updated_at=now() WHERE thumbnail_project_id=$1 AND status='queued'", [thumbnailId]);
-      const project = await client.query(`
-        UPDATE thumbnail_projects
-        SET frame_seconds=$2,source_headline_card_id=$3,brand_asset_id=$4,segmentation_provider=$5,
-          positive_box=$6::jsonb,negative_boxes=$7::jsonb,manifest_json=NULL,source_frame_asset_id=NULL,
-          subject_asset_id=NULL,preview_asset_id=NULL,export_asset_id=NULL,status='queued',error=NULL,updated_at=now()
-        WHERE id=$1
-        RETURNING *
-      `, [thumbnailId, frameSeconds, sourceHeadlineCardId, brandAssetId, segmentationProvider, positiveBox ? JSON.stringify(positiveBox) : null, JSON.stringify(negativeBoxes)]);
+      const project = canReuseCutout
+        ? await client.query(`
+          UPDATE thumbnail_projects
+          SET frame_seconds=$2,source_headline_card_id=$3,brand_asset_id=$4,segmentation_provider=$5,
+            positive_box=$6::jsonb,negative_boxes=$7::jsonb,manifest_json=$8::jsonb,export_asset_id=NULL,status='queued',error=NULL,updated_at=now()
+          WHERE id=$1
+          RETURNING *
+        `, [thumbnailId, frameSeconds, sourceHeadlineCardId, brandAssetId, segmentationProvider, positiveBox ? JSON.stringify(positiveBox) : null, JSON.stringify(negativeBoxes), JSON.stringify(nextManifest)])
+        : await client.query(`
+          UPDATE thumbnail_projects
+          SET frame_seconds=$2,source_headline_card_id=$3,brand_asset_id=$4,segmentation_provider=$5,
+            positive_box=$6::jsonb,negative_boxes=$7::jsonb,manifest_json=NULL,source_frame_asset_id=NULL,
+            subject_asset_id=NULL,preview_asset_id=NULL,export_asset_id=NULL,status='queued',error=NULL,updated_at=now()
+          WHERE id=$1
+          RETURNING *
+        `, [thumbnailId, frameSeconds, sourceHeadlineCardId, brandAssetId, segmentationProvider, positiveBox ? JSON.stringify(positiveBox) : null, JSON.stringify(negativeBoxes)]);
       const job = await client.query('INSERT INTO thumbnail_jobs(thumbnail_project_id) VALUES($1) RETURNING *', [thumbnailId]);
       await client.query('COMMIT');
       return { project: toThumbnailProject(project.rows[0]), job: toThumbnailJob(job.rows[0]) };

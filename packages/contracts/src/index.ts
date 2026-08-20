@@ -151,7 +151,29 @@ export const RenderSchema = z.object({ id: z.string().uuid(), candidateId: z.str
 export type CreateSource = z.infer<typeof CreateSourceSchema>; export type CreateJob = z.infer<typeof CreateJobSchema>; export type Job = z.infer<typeof JobSchema>; export type Probe = z.infer<typeof ProbeSchema>; export type Transcript = z.infer<typeof TranscriptSchema>; export type Candidate = z.infer<typeof CandidateSchema>; export type BrandAsset = z.infer<typeof BrandAssetSchema>; export type RenderSpec = z.infer<typeof RenderSpecSchema>; export type Render = z.infer<typeof RenderSchema>;
 export const thumbnailSegmentationProviders = ['sam3', 'u2netp'] as const;
 export const thumbnailProjectStates = ['queued', 'processing', 'ready', 'export_queued', 'exporting', 'completed', 'failed'] as const;
+export const thumbnailLayoutPresets = ['original', 'bold_statement', 'topic_first', 'quote_hook', 'data_callout', 'split_focus', 'clean_cut'] as const;
 export const ThumbnailBoxSchema = z.object({ x: z.number().nonnegative(), y: z.number().nonnegative(), width: z.number().positive(), height: z.number().positive() });
+export const ThumbnailPointSchema = z.object({ x: z.number().min(0).max(1), y: z.number().min(0).max(1) });
+export const ThumbnailLogoSchema = z.object({
+  enabled: z.boolean(),
+  brandAssetId: z.string().uuid().nullable(),
+  assetId: z.string().uuid().nullable(),
+  position: z.enum(logoPositions),
+});
+export const ThumbnailCompositionSchema = z.object({
+  layoutPreset: z.enum(thumbnailLayoutPresets),
+  subject: z.object({ position: ThumbnailPointSchema, scale: z.number().positive() }),
+  headline: z.object({ text: z.string(), sourceCardId: z.string().nullable() }),
+  background: z.object({ preset: z.enum(renderBackgrounds) }),
+  logo: ThumbnailLogoSchema,
+});
+const ThumbnailCompositionUpdateSchema = z.object({
+  layoutPreset: z.enum(thumbnailLayoutPresets).optional(),
+  subject: z.object({ position: ThumbnailPointSchema.optional(), scale: z.number().positive().optional() }).partial().optional(),
+  headline: z.object({ text: z.string().optional(), sourceCardId: z.string().nullable().optional() }).partial().optional(),
+  background: z.object({ preset: z.enum(renderBackgrounds).optional() }).partial().optional(),
+  logo: z.object({ enabled: z.boolean().optional(), brandAssetId: z.string().uuid().nullable().optional(), assetId: z.string().uuid().nullable().optional(), position: z.enum(logoPositions).optional() }).partial().optional(),
+}).partial();
 export const ThumbnailCreateSchema = z.object({
   frameSeconds: z.number().nonnegative().optional(),
   sourceHeadlineCardId: z.string().min(1).max(80).nullable().default(null),
@@ -159,6 +181,7 @@ export const ThumbnailCreateSchema = z.object({
   segmentationProvider: z.enum(thumbnailSegmentationProviders).optional(),
   positiveBox: ThumbnailBoxSchema.nullable().default(null),
   negativeBoxes: z.array(ThumbnailBoxSchema).max(32).default([]),
+  composition: ThumbnailCompositionUpdateSchema.optional(),
 });
 export const ThumbnailManifestSchema = z.object({
   schema: z.literal('axios.thumbnail.manifest.v1'),
@@ -170,12 +193,14 @@ export const ThumbnailManifestSchema = z.object({
   segmentation: z.object({ provider: z.enum(thumbnailSegmentationProviders), positiveBox: ThumbnailBoxSchema.nullable(), negativeBoxes: z.array(ThumbnailBoxSchema) }),
   headlineCard: z.object({ id: z.string(), text: z.string(), color: z.string().nullable() }).nullable(),
   branding: z.object({ brandAssetId: z.string().uuid().nullable(), assetId: z.string().uuid().nullable() }),
+  composition: ThumbnailCompositionSchema.optional(),
   assets: z.object({
     sourceFrame: z.object({ key: z.string(), assetId: z.string().uuid().nullable() }),
     subject: z.object({ key: z.string(), assetId: z.string().uuid().nullable() }),
     preview: z.object({ key: z.string(), assetId: z.string().uuid().nullable() }),
     manifest: z.object({ key: z.string() }),
     export: z.object({ key: z.string(), assetId: z.string().uuid().nullable() }),
+    variants: z.record(z.object({ key: z.string(), assetId: z.string().uuid().nullable() })).default({}),
   }),
   createdAt: z.string().datetime(),
 });
