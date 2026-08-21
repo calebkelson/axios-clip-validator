@@ -258,7 +258,17 @@ export class RenderProcessor {
       const nameTags = readNameTagsFromSpec(renderSpec) ?? readNameTags(job.social_copy);
       await this.updateProgress(renderId, 35);
       const outputPath = join(workDir, 'clip.mp4');
-      const renderResult = await this.renderVideo(job, sourcePath, profile, job.fit_mode, job.background, job.logo_position, logoPath, startSeconds, endSeconds, job.caption_mode === 'burned' ? captions.ass : null, captions.events, headlineCards, nameTags, renderSpec, workDir, outputPath);
+      let lastRenderProgress = 35;
+      const reportRenderProgress = async (progress: number) => {
+        if (progress <= lastRenderProgress) return;
+        lastRenderProgress = progress;
+        try {
+          await this.updateProgress(renderId, progress);
+        } catch (error) {
+          console.warn(`Render progress update failed for ${renderId}: ${error instanceof Error ? error.message : String(error)}`);
+        }
+      };
+      const renderResult = await this.renderVideo(job, sourcePath, profile, job.fit_mode, job.background, job.logo_position, logoPath, startSeconds, endSeconds, job.caption_mode === 'burned' ? captions.ass : null, captions.events, headlineCards, nameTags, renderSpec, workDir, outputPath, reportRenderProgress);
       timings.encoder = renderResult.encoder;
       timings.chromiumOverlayMs = Math.round(renderResult.overlayMs);
       timings.ffmpegEncodingMs = Math.round(renderResult.encodingMs);
@@ -353,7 +363,7 @@ export class RenderProcessor {
     return this.store.materialize(result.rows[0].storage_key as string, join(workDir, 'brand'));
   }
 
-  private async renderVideo(job: RenderJobRow, sourcePath: string, profile: typeof renderProfiles[RenderProfileName], fitMode: RenderFitMode, background: RenderBackground, logoPosition: LogoPosition, logoPath: string | null, startSeconds: number, endSeconds: number, assPath: string | null, captionEvents: CaptionEvent[], headlineCards: HeadlineCardInput[], nameTags: NameTagInput[], renderSpec: ResolvedRenderSpec | null, workDir: string, outputPath: string): Promise<RenderVideoResult> {
+  private async renderVideo(job: RenderJobRow, sourcePath: string, profile: typeof renderProfiles[RenderProfileName], fitMode: RenderFitMode, background: RenderBackground, logoPosition: LogoPosition, logoPath: string | null, startSeconds: number, endSeconds: number, assPath: string | null, captionEvents: CaptionEvent[], headlineCards: HeadlineCardInput[], nameTags: NameTagInput[], renderSpec: ResolvedRenderSpec | null, workDir: string, outputPath: string, onProgress?: (progress: number) => void | Promise<void>): Promise<RenderVideoResult> {
     const logoHeight = readLogoHeight(profile, renderSpec);
     const encoder = await this.selectVideoEncoder();
     const requestedRenderer = typeof renderSpec?.rendererTarget === 'string'
@@ -388,6 +398,7 @@ export class RenderProcessor {
         videoToolboxBitrate: process.env.FFMPEG_VT_BITRATE,
         ffmpegPreset: process.env.FFMPEG_PRESET,
         ffmpegCrf: process.env.FFMPEG_CRF,
+        onProgress,
       });
       try {
         const result = await renderChromium(encoder);

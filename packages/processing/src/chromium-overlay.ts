@@ -106,6 +106,12 @@ export type ChromiumOverlayOptions = {
   videoToolboxBitrate?: string;
   ffmpegPreset?: string;
   ffmpegCrf?: string;
+  /**
+   * Coarse render progress (36–68) for the queue UI. The callback is advisory;
+   * a transient database/reporting error must not abort an otherwise healthy
+   * Chromium/FFmpeg render.
+   */
+  onProgress?: (progress: number) => void | Promise<void>;
 };
 
 export type VideoEncoder = 'libx264' | 'h264_videotoolbox';
@@ -153,6 +159,18 @@ export async function renderWithChromiumOverlay(options: ChromiumOverlayOptions)
   const htmlPath = join(options.workDir, 'editor-overlay.html');
   await writeFile(htmlPath, buildOverlayHtml(options), 'utf8');
 
+  let lastReportedProgress = 35;
+  const reportProgress = async (progress: number) => {
+    if (!options.onProgress || progress <= lastReportedProgress) return;
+    lastReportedProgress = progress;
+    try {
+      await options.onProgress(progress);
+    } catch (error) {
+      console.warn(`Chromium overlay progress update failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  };
+  await reportProgress(37);
+
   const browser = await chromium.launch({
     executablePath,
     headless: true,
@@ -163,6 +181,7 @@ export async function renderWithChromiumOverlay(options: ChromiumOverlayOptions)
     const page = await browser.newPage({ viewport: { width: options.width, height: options.height }, deviceScaleFactor: 1 });
     await page.goto(pathToFileURL(htmlPath).href, { waitUntil: 'load' });
     await page.evaluate(() => document.fonts.ready);
+    await reportProgress(42);
 
     const duration = options.duration;
     const frames = Math.max(1, Math.ceil(duration * options.fps));
@@ -206,6 +225,7 @@ export async function renderWithChromiumOverlay(options: ChromiumOverlayOptions)
       ffmpeg?.once('close', (code) => code === 0 ? resolve() : reject(new Error(`${options.ffmpegBinary} exited with ${code}: ${stderr.trim()}`)));
     });
 
+    const frameReportEvery = Math.max(1, Math.floor(frames / 20));
     for (let frame = 0; frame < frames; frame += 1) {
       const time = Math.min(duration - 0.0001, frame / options.fps);
       await page.evaluate((currentTime) => {
@@ -214,11 +234,21 @@ export async function renderWithChromiumOverlay(options: ChromiumOverlayOptions)
       const png = await page.screenshot({ type: 'png', omitBackground: true });
       const stdin = ffmpeg.stdin;
       if (!stdin) throw new Error('FFmpeg overlay input pipe was not available');
-      if (!stdin.write(png)) await once(stdin, 'drain');
+      if (!stdin.write(png)) {
+        await Promise.race([
+          once(stdin, 'drain'),
+          ffmpegDone.then(() => { throw new Error('FFmpeg exited before Chromium finished sending overlay frames'); }),
+        ]);
+      }
+      if (frame === frames - 1 || (frame + 1) % frameReportEvery === 0) {
+        await reportProgress(42 + Math.round(((frame + 1) / frames) * 18));
+      }
     }
     ffmpeg.stdin?.end();
+    await reportProgress(62);
     const overlayFinishedAt = nowMs();
     await ffmpegDone;
+    await reportProgress(68);
     return {
       overlayMs: Math.max(0, overlayFinishedAt - startedAt),
       encodingMs: Math.max(0, nowMs() - encodingStartedAt),
