@@ -90,9 +90,11 @@ type CaptionStyle = {
 };
 
 type ResolvedRenderSpec = {
+  schema?: unknown;
   rendererTarget?: unknown;
   source?: { startSeconds?: unknown; endSeconds?: unknown };
-  logo?: { heightPercent?: unknown };
+  video?: { reframe?: unknown };
+  logo?: { heightPercent?: unknown; placementMode?: unknown; anchorPercent?: unknown };
   headlineCards?: unknown;
   nameTags?: unknown;
   captions?: {
@@ -353,6 +355,10 @@ export class RenderProcessor {
       ? renderSpec.rendererTarget
       : process.env.RENDERER_TARGET ?? 'headless_chromium';
     const chromiumAvailable = requestedRenderer === 'headless_chromium' && Boolean(findChromiumExecutable());
+    const hasExplicitRenderSpec = renderSpec?.schema === 'axios.clip.render-spec.v1';
+    if (requestedRenderer === 'headless_chromium' && hasExplicitRenderSpec && !chromiumAvailable && process.env.RENDERER_REQUIRE_CHROMIUM !== 'false') {
+      throw new Error('Exact render spec requires Chromium; no Chrome/Chromium executable is available');
+    }
     if (chromiumAvailable) {
       const renderChromium = (videoEncoder: VideoEncoder) => renderWithChromiumOverlay({
         ffmpegBinary: this.ffmpegBinary,
@@ -360,8 +366,8 @@ export class RenderProcessor {
         logoPath: job.include_logo ? logoPath : null,
         outputPath,
         workDir,
-        baseFilter: baseVideoFilter(profile, fitMode, background),
-        logoFilter: job.include_logo && logoPath ? { ...logoOverlayPosition(profile, logoPosition), height: logoHeight } : null,
+        baseFilter: baseVideoFilter(profile, fitMode, background, readVideoReframe(renderSpec)),
+        logoFilter: job.include_logo && logoPath ? { ...logoOverlayPosition(profile, logoPosition, readLogoAnchorPercent(renderSpec)), height: logoHeight } : null,
         width: profile.width,
         height: profile.height,
         fps: 30,
@@ -400,11 +406,11 @@ export class RenderProcessor {
     // Captions sit below headline cards/name tags in the editor (z-index 2 vs
     // z-index 3). Apply them first so later overlays cannot be painted over.
     const captionFilter = assPath ? `,subtitles=${escapeFilterPath(assPath)}${fontsDir}` : '';
-    const baseFilter = `${baseVideoFilter(profile, fitMode, background)}${captionFilter}${headlineFilter}${nameTagFilter}`;
+    const baseFilter = `${baseVideoFilter(profile, fitMode, background, readVideoReframe(renderSpec))}${captionFilter}${headlineFilter}${nameTagFilter}`;
     const duration = (endSeconds - startSeconds).toFixed(3);
     const args = ['-y', '-ss', startSeconds.toFixed(3), '-i', sourcePath];
     if (job.include_logo && logoPath) {
-      const position = logoOverlayPosition(profile, logoPosition);
+      const position = logoOverlayPosition(profile, logoPosition, readLogoAnchorPercent(renderSpec));
       args.push('-loop', '1', '-i', logoPath, '-filter_complex', `[0:v]${baseFilter}[base];[1:v]scale=-1:${logoHeight}[logo];[base][logo]overlay=${position.x}:${position.y}:format=auto[v]`, '-map', '[v]');
     } else {
       args.push('-vf', baseFilter, '-map', '0:v:0');
@@ -536,6 +542,27 @@ function asRecord(value: unknown): Record<string, unknown> | null {
 
 function readRenderSpec(value: unknown): ResolvedRenderSpec | null {
   return asRecord(value) as ResolvedRenderSpec | null;
+}
+
+function readLogoAnchorPercent(spec: ResolvedRenderSpec | null): { x: number; y: number } | undefined {
+  if (spec?.logo?.placementMode !== 'freeform') return undefined;
+  const anchor = asRecord(spec.logo.anchorPercent);
+  const x = Number(anchor?.x);
+  const y = Number(anchor?.y);
+  if (!Number.isFinite(x) || !Number.isFinite(y)) return undefined;
+  return { x: Math.max(0, Math.min(100, x)), y: Math.max(0, Math.min(100, y)) };
+}
+
+type VideoReframe = { x: number; y: number; scale: number };
+
+function readVideoReframe(spec: ResolvedRenderSpec | null): VideoReframe | undefined {
+  const reframe = asRecord(spec?.video?.reframe);
+  if (!reframe) return undefined;
+  return {
+    x: clampRange(reframe.x, 0, 100, 50),
+    y: clampRange(reframe.y, 0, 100, 50),
+    scale: clampRange(reframe.scale, 0.75, 1.75, 1),
+  };
 }
 
 function readStringArray(value: unknown) {
@@ -910,13 +937,19 @@ function wrapHeadline(text: string, widthPercent = 40) {
   return lines.join('\n');
 }
 
-export function logoOverlayPosition(profile: typeof renderProfiles[RenderProfileName], position: LogoPosition) {
+export function logoOverlayPosition(profile: typeof renderProfiles[RenderProfileName], position: LogoPosition, anchorPercent?: { x: number; y: number }) {
+  if (anchorPercent) {
+    return {
+      x: `((main_w-overlay_w)*${anchorPercent.x}/100)`,
+      y: `((main_h-overlay_h)*${anchorPercent.y}/100)`,
+    };
+  }
   const x = position.endsWith('left') ? String(profile.marginX) : position.endsWith('right') ? `main_w-overlay_w-${profile.marginX}` : '(main_w-overlay_w)/2';
   const y = position.startsWith('top') ? String(profile.safeTop) : position.startsWith('bottom') ? `main_h-overlay_h-${profile.safeBottom}` : '(main_h-overlay_h)/2';
   return { x, y };
 }
 
-function baseVideoFilter(profile: typeof renderProfiles[RenderProfileName], fitMode: RenderFitMode, background: RenderBackground = 'dark_blue') {
+export function baseVideoFilter(profile: typeof renderProfiles[RenderProfileName], fitMode: RenderFitMode, background: RenderBackground = 'dark_blue', reframe?: VideoReframe) {
   if (fitMode === 'contain' && background === 'blurred') {
     return `split=2[blur_source][video_source];[blur_source]scale=${profile.width}:${profile.height}:force_original_aspect_ratio=increase,crop=${profile.width}:${profile.height},boxblur=20:2[blurred];[video_source]scale=${profile.width}:${profile.height}:force_original_aspect_ratio=decrease[video];[blurred][video]overlay=(W-w)/2:(H-h)/2:format=auto,setsar=1`;
   }
@@ -924,7 +957,21 @@ function baseVideoFilter(profile: typeof renderProfiles[RenderProfileName], fitM
     const color = background === 'black' ? '0x000000' : background === 'white' ? '0xFFFFFF' : '0x101624';
     return `scale=${profile.width}:${profile.height}:force_original_aspect_ratio=decrease,pad=${profile.width}:${profile.height}:(ow-iw)/2:(oh-ih)/2:color=${color},setsar=1`;
   }
-  return `scale=${profile.width}:${profile.height}:force_original_aspect_ratio=increase,crop=${profile.width}:${profile.height},setsar=1`;
+  const normalizedReframe = reframe ?? { x: 50, y: 50, scale: 1 };
+  if (normalizedReframe.x === 50 && normalizedReframe.y === 50 && normalizedReframe.scale === 1) {
+    return `scale=${profile.width}:${profile.height}:force_original_aspect_ratio=increase,crop=${profile.width}:${profile.height},setsar=1`;
+  }
+  const xPercent = (normalizedReframe.x / 100).toFixed(4);
+  const yPercent = (normalizedReframe.y / 100).toFixed(4);
+  const scale = normalizedReframe.scale.toFixed(4);
+  const color = background === 'black' ? '0x000000' : background === 'white' ? '0xFFFFFF' : '0x101624';
+  return [
+    `scale=${profile.width}:${profile.height}:force_original_aspect_ratio=increase`,
+    `scale=iw*${scale}:ih*${scale}`,
+    `crop=min(iw\\,${profile.width}):min(ih\\,${profile.height}):max(0\\,${xPercent}*(iw-${profile.width})):max(0\\,${yPercent}*(ih-${profile.height}))`,
+    `pad=${profile.width}:${profile.height}:(ow-iw)/2:(oh-ih)/2:color=${color}`,
+    'setsar=1',
+  ].join(',');
 }
 
 function cleanCaptionText(value: string) {
