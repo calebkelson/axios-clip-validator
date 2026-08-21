@@ -98,11 +98,39 @@ test('Chromium overlay gives captions an exact safe width and a word-boundary sa
     }],
     captionPosition: { x: 50, y: 84 },
     captionStyle: { fontSizePx: 72, maxWidthPercent: 84, gapEm: 0.32 },
+    captionLayoutMode: 'measured',
     fontPath: null,
   });
 
   assert.match(html, /\.caption-line \{[^}]*flex-wrap: wrap;[^}]*width: 100%;[^}]*max-width: 100%/);
-  assert.match(html, /captions\.style\.width = clamp\(style\.maxWidthPercent, 84, 1, 100\) \+ '%'/);
-  assert.match(html, /captions\.style\.maxWidth = 'none'/);
+  assert.match(html, /captions\.style\.width = measuredCaptionLayout \? 'max-content' : maxWidthPercent \+ '%'/);
+  assert.match(html, /caption-line-measured/);
+  assert.match(html, /caption-line-overflow/);
   assert.match(html, /\.headline-card, \.name-tag \{[^}]*overflow: hidden;/);
+});
+
+test('Chromium overlay derives headline radius and legacy line wrapping from the saved shape', () => {
+  const html = buildOverlayHtml({
+    ffmpegBinary: 'ffmpeg',
+    sourcePath: '/tmp/source.mp4',
+    logoPath: null,
+    outputPath: '/tmp/output.mp4',
+    workDir: '/tmp',
+    baseFilter: 'null',
+    logoFilter: null,
+    width: 1080,
+    height: 1920,
+    fps: 30,
+    startSeconds: 0,
+    duration: 1,
+    headlineCards: [{ id: 'card', text: 'Headline', startSeconds: 0, endSeconds: 1, color: 'navy', shape: 'rounded', xPercent: 50, yPercent: 70, widthPercent: 84, heightPercent: 21, transitionSeconds: 0.35 }],
+    nameTags: [],
+    captionEvents: [],
+    captionPosition: { x: 50, y: 84 },
+    captionStyle: {},
+    fontPath: null,
+  });
+
+  assert.match(html, /item\.shape === 'pill'/);
+  assert.match(html, /headline-line-legacy/);
 });

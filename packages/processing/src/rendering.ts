@@ -393,6 +393,7 @@ export class RenderProcessor {
         captionEvents: job.caption_mode === 'burned' ? captionEvents as unknown as ChromiumOverlayEvent[] : [],
         captionPosition: readCaptionPosition(renderSpec?.captions?.positionPercent) ?? readSubtitlePosition(job.social_copy),
         captionStyle: readCaptionStyle(renderSpec, job.social_copy),
+        captionLayoutMode: Array.isArray(renderSpec?.captions?.lines) && Array.isArray(renderSpec?.captions?.words) ? 'measured' : 'legacy',
         fontPath: this.brandFontPath,
         videoEncoder,
         videoToolboxBitrate: process.env.FFMPEG_VT_BITRATE,
@@ -783,6 +784,7 @@ function readHeadlineCards(socialCopy: Record<string, unknown>): HeadlineCardInp
       shape: card.shape === 'pill' ? ('pill' as const) : ('rounded' as const),
       ...geometry,
       transitionSeconds: clampRange(card.transitionSeconds, 0.05, 2, 0.35),
+      borderRadiusPx: card.shape === 'pill' ? 999 : 12,
     }];
   }).filter((card) => card.endSeconds > card.startSeconds).slice(0, 12);
 }

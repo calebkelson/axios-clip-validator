@@ -101,6 +101,7 @@ export type ChromiumOverlayOptions = {
   captionEvents: ChromiumOverlayEvent[];
   captionPosition: { x: number; y: number };
   captionStyle: ChromiumOverlayStyle | undefined;
+  captionLayoutMode?: 'measured' | 'legacy';
   fontPath: string | null;
   videoEncoder?: VideoEncoder;
   videoToolboxBitrate?: string;
@@ -283,6 +284,7 @@ export function buildOverlayHtml(options: ChromiumOverlayOptions) {
     captionEvents: options.captionEvents,
     captionPosition: options.captionPosition,
     captionStyle: options.captionStyle ?? {},
+    captionLayoutMode: options.captionLayoutMode ?? 'legacy',
   }).replace(/</g, '\\u003c');
   return `<!doctype html>
 <html><head><meta charset="utf-8"><style>
@@ -294,8 +296,11 @@ html, body { margin: 0; width: ${options.width}px; height: ${options.height}px; 
 .name-tag { z-index: 4; align-items: flex-start; text-align: left; overflow: hidden; }
 .headline-card-content { width: 100%; height: 100%; box-sizing: border-box; display: flex; flex-direction: column; justify-content: center; align-items: center; overflow: hidden; border-radius: inherit; }
 .headline-line { display: block; width: 100%; white-space: nowrap; overflow: hidden; }
+.headline-line-legacy { white-space: normal; overflow-wrap: anywhere; }
 .caption-layer { position: absolute; z-index: 2; transform: translate(-50%, -50%); box-sizing: border-box; display: flex; flex-direction: column; align-items: center; text-align: center; pointer-events: none; }
 .caption-line { display: flex; flex-wrap: wrap; justify-content: center; width: 100%; max-width: 100%; gap: .32em; white-space: normal; }
+.caption-line-measured { flex-wrap: nowrap; width: max-content; white-space: nowrap; }
+.caption-line-overflow { flex-wrap: wrap; width: 100%; white-space: normal; }
 .caption-word { display: inline-block; max-width: 100%; overflow-wrap: anywhere; }
 </style></head><body><main id="canvas"><section id="captions" class="caption-layer"></section><section id="headlines"></section><section id="name-tags"></section></main>
 <script>
@@ -323,7 +328,11 @@ const setBoxStyle = (node, item, style) => {
   node.style.background = safeCss(style.backgroundColor, colorForName(item.color, 'background'));
   node.style.color = safeCss(style.textColor, colorForName(item.color, 'text'));
   node.style.border = safeCss(style.border, 'none');
-  node.style.borderRadius = Math.max(0, Number(style.borderRadiusPx) || 0) + 'px';
+  const explicitRadius = Number(style.borderRadiusPx);
+  const radius = item.shape === 'pill'
+    ? 999
+    : (Number.isFinite(explicitRadius) ? Math.max(0, explicitRadius) : item.shape === 'rounded' ? 12 : 0);
+  node.style.borderRadius = radius + 'px';
   node.style.boxShadow = safeCss(style.boxShadow, 'none');
   node.style.fontFamily = safeCss(style.fontFamily, 'NB International Pro, Arial, sans-serif');
   node.style.fontWeight = String(clamp(style.fontWeight, 700, 100, 900));
@@ -367,7 +376,8 @@ const cardEntries = data.cards.map((item) => {
     setBoxStyle(node, item, style);
     const lines = Array.isArray(item.lines) && item.lines.length ? item.lines : [item.text];
     const content = document.createElement('div'); content.className = 'headline-card-content';
-    lines.forEach((line) => { const span = document.createElement('span'); span.className = 'headline-line'; span.textContent = line; content.appendChild(span); });
+    const measuredLines = Array.isArray(item.lines) && item.lines.length;
+    lines.forEach((line) => { const span = document.createElement('span'); span.className = measuredLines ? 'headline-line' : 'headline-line headline-line-legacy'; span.textContent = line; content.appendChild(span); });
     node.appendChild(content);
     headlines.appendChild(node);
     node.hidden = false;
@@ -389,13 +399,15 @@ const nameTagEntries = data.nameTags.map((item) => {
     return { item, node };
   });
 const style = data.captionStyle || {};
+const measuredCaptionLayout = data.captionLayoutMode === 'measured';
   captions.style.left = clamp(data.captionPosition.x, 50, 0, 100) + '%';
   captions.style.top = clamp(data.captionPosition.y, 84, 0, 100) + '%';
-  // A max-width alone leaves a shrink-to-fit flex box whose nowrap children can
-  // paint beyond the video. Give the caption layer the editor's exact resolved
-  // width and allow a word-boundary safety wrap for legacy/stale line layouts.
-  captions.style.width = clamp(style.maxWidthPercent, 84, 1, 100) + '%';
-  captions.style.maxWidth = 'none';
+  // Measured editor lines are already wrapped against this safe width. Keep
+  // each line as a single no-wrap box so Chromium cannot invent new breaks.
+  // Legacy snapshots use a fixed safe-width box with a word-boundary fallback.
+  const maxWidthPercent = clamp(style.maxWidthPercent, 84, 1, 100);
+  captions.style.width = measuredCaptionLayout ? 'max-content' : maxWidthPercent + '%';
+  captions.style.maxWidth = measuredCaptionLayout ? maxWidthPercent + '%' : 'none';
   captions.style.fontFamily = safeCss(style.fontFamily, 'NB International Pro, Arial, sans-serif');
   captions.style.fontWeight = String(clamp(style.fontWeight, 700, 100, 900));
   captions.style.fontSize = Math.max(5, Number(style.fontSizePx) || 22) + 'px';
@@ -404,7 +416,7 @@ const style = data.captionStyle || {};
   captions.style.color = safeCss(style.color, '#ffffff');
   captions.style.gap = Math.max(0, Number(style.gapEm) || 0.32) + 'em';
 const captionEntries = data.captionEvents.map((event) => {
-    const line = document.createElement('div'); line.className = 'caption-line';
+    const line = document.createElement('div'); line.className = measuredCaptionLayout ? 'caption-line caption-line-measured' : 'caption-line';
     line.style.gap = Math.max(0, Number(style.gapEm) || 0.32) + 'em';
     const words = event.words.map((word) => {
       const span = document.createElement('span'); span.className = 'caption-word'; span.textContent = word.text;
@@ -414,6 +426,17 @@ const captionEntries = data.captionEvents.map((event) => {
     captions.appendChild(line);
     return { event, line, words };
   });
+if (measuredCaptionLayout) {
+  const maxCaptionWidth = canvas.clientWidth * maxWidthPercent / 100;
+  captionEntries.forEach(({ line }) => {
+    // A stale or incorrectly measured line is still kept inside the canvas;
+    // only that line falls back to the legacy safety wrap.
+    if (line.scrollWidth > maxCaptionWidth + 1) {
+      line.classList.remove('caption-line-measured');
+      line.classList.add('caption-line-overflow');
+    }
+  });
+}
 const render = () => {
   const time = window.renderTime;
   cardEntries.forEach(({ item, node }) => updateBox(node, item, false));
