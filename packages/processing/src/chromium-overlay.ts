@@ -290,6 +290,7 @@ export function buildOverlayHtml(options: ChromiumOverlayOptions) {
 <html><head><meta charset="utf-8"><style>
 @font-face { font-family: "NB International Pro"; src: url("${fontUrl ?? ''}") format("truetype"); font-weight: 700; }
 html, body { margin: 0; width: ${options.width}px; height: ${options.height}px; overflow: hidden; background: transparent; }
+[hidden] { display: none !important; }
 #canvas { position: relative; width: ${options.width}px; height: ${options.height}px; overflow: hidden; background: transparent; font-family: "NB International Pro", Arial, sans-serif; }
 .headline-card, .name-tag { position: absolute; box-sizing: border-box; display: flex; flex-direction: column; justify-content: center; align-items: center; text-align: center; overflow: hidden; }
 .headline-card { z-index: 3; }

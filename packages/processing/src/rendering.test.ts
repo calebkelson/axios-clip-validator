@@ -107,6 +107,7 @@ test('Chromium overlay gives captions an exact safe width and a word-boundary sa
   assert.match(html, /caption-line-measured/);
   assert.match(html, /caption-line-overflow/);
   assert.match(html, /\.headline-card, \.name-tag \{[^}]*overflow: hidden;/);
+  assert.match(html, /\[hidden\] \{ display: none !important; \}/);
 });
 
 test('Chromium overlay derives headline radius and legacy line wrapping from the saved shape', () => {
